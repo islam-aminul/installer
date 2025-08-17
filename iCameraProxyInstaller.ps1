@@ -773,25 +773,49 @@ function Install-FileCatalystHotFolder {
         } catch {}
     }
     if (-not $exePath) { Write-Log WARN 'FileCatalyst HotFolder installer EXE not found.'; return }
-    # Build absolute INF path and enforce it in args
-    $infPath = $script:FileCatalystINF
-    $saveArgsArr = @()
-    foreach ($arg in ($fc.saveInfArgs | ForEach-Object { Replace-Tokens -Text $_ })) {
-        if ($arg -match '^(?i)(/|-)SAVEINF(?::|=)?') { $arg = ('/SAVEINF="{0}"' -f $infPath) }
-        $saveArgsArr += $arg
+    # Derive INF path from dependency name (e.g., "FileCatalyst HotFolder" -> filecatalyst_hotfolder.inf)
+    $safeName = (($fc.name | ForEach-Object { $_ }) -join ' ')
+    if (-not $safeName) { $safeName = 'filecatalyst_hotfolder' }
+    $safeName = ($safeName -replace '[^A-Za-z0-9]+','_').ToLower()
+    $infPath = Join-Path $script:BaseDir ("{0}.inf" -f $safeName)
+
+    # Helper to build args with replaced INF path
+    function _Build-ArgsWithInf([string[]]$args, [string]$switch) {
+        $out = @()
+        foreach ($a in ($args | ForEach-Object { Replace-Tokens -Text $_ })) {
+            if ($a -match ("^(?i)(/|-)" + [regex]::Escape($switch) + "(?::|=)?")) {
+                $a = ('/{0}="{1}"' -f $switch, $infPath)
+            }
+            $out += $a
+        }
+        return ($out -join ' ')
     }
-    $saveArgs = $saveArgsArr -join ' '
-    Write-Log INFO "Running FileCatalyst HotFolder SAVEINF: $saveArgs (wd=$script:BaseDir)"
-    Start-Process -FilePath $exePath -ArgumentList $saveArgs -WorkingDirectory $script:BaseDir -Wait -PassThru | Out-Null
-    # LOADINF
-    $loadArgsArr = @()
-    foreach ($arg in ($fc.loadInfArgs | ForEach-Object { Replace-Tokens -Text $_ })) {
-        if ($arg -match '^(?i)(/|-)LOADINF(?::|=)?') { $arg = ('/LOADINF="{0}"' -f $infPath) }
-        $loadArgsArr += $arg
+
+    # If INF exists, prompt user for reinstall behavior and show detected Dir
+    $useExisting = $false
+    if (Test-Path -LiteralPath $infPath) {
+        $dirLine = $null
+        try {
+            $dirLine = (Select-String -LiteralPath $infPath -Pattern '^(?i)Dir=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1).Matches.Value
+        } catch {}
+        $detectedDir = $null
+        if ($dirLine -and $dirLine -match '^(?i)Dir=(.+)$') { $detectedDir = $Matches[1].Trim() }
+        $prompt = "Found previous FileCatalyst configuration: `nINF: $infPath`nInstall Dir: ${detectedDir}`nChoose: [1] Reinstall using previous configuration (silent)  [2] Reinstall without previous configuration (standard).`nEnter 1 or 2 [1]: "
+        $choice = Read-Host -Prompt $prompt
+        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq '1') { $useExisting = $true }
     }
-    $loadArgs = $loadArgsArr -join ' '
-    Write-Log INFO "Running FileCatalyst HotFolder LOADINF: $loadArgs (wd=$script:BaseDir)"
-    Start-Process -FilePath $exePath -ArgumentList $loadArgs -WorkingDirectory $script:BaseDir -Wait -PassThru | Out-Null
+
+    if ($useExisting) {
+        $loadArgs = _Build-ArgsWithInf -args $fc.loadInfArgs -switch 'LOADINF'
+        Write-Log INFO "Running FileCatalyst HotFolder LOADINF: $loadArgs (wd=$script:BaseDir)"
+        $p = Start-Process -FilePath $exePath -ArgumentList $loadArgs -WorkingDirectory $script:BaseDir -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Write-Log WARN ("FileCatalyst LOADINF exited with code {0}" -f $p.ExitCode) }
+    } else {
+        $saveArgs = _Build-ArgsWithInf -args $fc.saveInfArgs -switch 'SAVEINF'
+        Write-Log INFO "Running FileCatalyst HotFolder SAVEINF (standard install): $saveArgs (wd=$script:BaseDir)"
+        $p = Start-Process -FilePath $exePath -ArgumentList $saveArgs -WorkingDirectory $script:BaseDir -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Write-Log WARN ("FileCatalyst SAVEINF exited with code {0}" -f $p.ExitCode) }
+    }
 }
 
 function Get-FileCatalystInstallDir {
