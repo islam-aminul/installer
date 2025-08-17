@@ -1,0 +1,62 @@
+# Installer project .gitignore
+
+# OS-specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Archives and installers
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.rar
+*.bz2
+*.iso
+
+# Windows executables and installers
+*.exe
+*.msi
+*.dll
+*.pdb
+*.ocx
+
+# Scripts and batch outputs (keep source .ps1/.bat tracked)
+*.cmd
+
+# Logs
+*.log
+*.log.*
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+~$*
+*.swp
+*.swo
+
+# Tooling cache/binaries
+/tools/
+7zr.exe
+
+# FileCatalyst runtime/config artifacts
+filecatalyst_settings.inf
+filecatalyst_hotfolder.inf
+hotfolders.xml
+
+# Build/output directories (none currently, future-proofing)
+/dist/
+/build/
+/target/
+/out/
+
+# IDE/project metadata
+.vscode/
+.idea/
+*.iml
