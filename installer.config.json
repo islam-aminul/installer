@@ -1,0 +1,289 @@
+{
+  "metadata": {
+    "productName": "iCameraProxy",
+    "displayName": "iCamera Proxy",
+    "displayVersion": "1.0.0"
+  },
+  "networkChecks": {
+    "urls": [
+      "https://g01.tcsion.com",
+      "https://cctv4.tcsion.com",
+      "https://cctv8.tcsion.com"
+    ]
+  },
+  "options": {
+    "skipShaChecks": true
+  },
+  "paths": {
+    "proxySubfolder": "<Install Root>\\proxy",
+    "logsFolder": "<Install Root>\\logs",
+    "configFolder": "<Install Root>\\config"
+  },
+  "application": {
+    "files": [
+      {
+        "source": "CameraProxy.jar",
+        "dest": "<Install Root>\\proxy\\"
+      },
+      {
+        "source": "cameraproxy.properties",
+        "dest": "<Install Root>\\proxy\\"
+      },
+      {
+        "source": "logback.xml",
+        "dest": "<Install Root>\\proxy\\"
+      },
+      {
+        "source": "cameraproxy.sql",
+        "dest": "<Install Root>\\proxy\\"
+      }
+    ],
+    "properties": {
+      "cameraproxy": {
+        "file": "<Install Root>\\proxy\\cameraproxy.properties",
+        "keys": {
+          "dbPort": "db.port",
+          "fileCatalystHotFolders": "filecatalyst.hot_folders",
+          "fileCatalystInstallDir": "filecatalyst.install_dir"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "java": {
+      "name": "OpenJDK 8 JRE",
+      "url": "https://corretto.aws/downloads/latest/amazon-corretto-8-x64-windows-jre.zip",
+      "sha256": "REPLACE_WITH_SHA256",
+      "target": "<Install Root>\\jre",
+      "enforceLocalOnly": false,
+      "search": {
+        "patterns": [
+          "amazon-corretto-*",
+          "corretto*",
+          "openjdk*",
+          "jre*"
+        ],
+        "extensions": [
+          ".zip"
+        ]
+      }
+    },
+    "ffmpeg": {
+      "name": "FFmpeg Essentials",
+      "url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.7z",
+      "sha256": "REPLACE_WITH_SHA256",
+      "target": "<Install Root>\\ffmpeg",
+      "enforceLocalOnly": false,
+      "search": {
+        "patterns": [
+          "ffmpeg*"
+        ],
+        "extensions": [
+          ".7z",
+          ".zip"
+        ]
+      }
+    },
+    "procrun": {
+      "name": "Apache Procrun",
+      "url": "https://archive.apache.org/dist/commons/daemon/binaries/windows/commons-daemon-1.4.0-bin-windows.zip",
+      "sha256": "REPLACE_WITH_SHA256",
+      "target": "<Install Root>\\procrun",
+      "enforceLocalOnly": false,
+      "search": {
+        "patterns": [
+          "commons-daemon-*",
+          "procrun*",
+          "prunsrv*"
+        ],
+        "extensions": [
+          ".zip"
+        ]
+      }
+    },
+    "hsqldb": {
+      "name": "HSQLDB",
+      "url": "https://downloads.sourceforge.net/project/hsqldb/hsqldb/hsqldb_2_7/hsqldb-2.7.4.zip",
+      "sha256": "REPLACE_WITH_SHA256",
+      "target": "<Install Root>\\hsqldb",
+      "enforceLocalOnly": false,
+      "dbName": "db0",
+      "portRange": {
+        "start": 9001,
+        "end": 9100
+      },
+      "sqlInitScripts": [
+        "<Install Root>\\proxy\\cameraproxy.sql"
+      ],
+      "search": {
+        "patterns": [
+          "hsqldb-*",
+          "hsqldb*"
+        ],
+        "extensions": [
+          ".zip"
+        ]
+      }
+    },
+    "filecatalyst": {
+      "name": "FileCatalyst HotFolder",
+      "url": "https://filecatalyst.software/public/filecatalyst/Direct/4.0.0.375/Windows/install_fc_hotfolder.exe",
+      "sha256": "REPLACE_WITH_SHA256",
+      "target": "<Install Root>\\filecatalyst",
+      "enforceLocalOnly": false,
+      "saveInfArgs": [
+        "/SAVEINF=filecatalyst_settings.inf"
+      ],
+      "loadInfArgs": [
+        "/LOADINF=filecatalyst_settings.inf",
+        "/VERYSILENT",
+        "/NORESTART"
+      ],
+      "search": {
+        "patterns": [
+          "*hotfolder*",
+          "install_fc_hotfolder*",
+          "*filecatalyst*"
+        ],
+        "extensions": [
+          ".exe"
+        ]
+      }
+    }
+  },
+  "tools": {
+    "sevenZip": {
+      "portableUrl": "https://www.7-zip.org/a/7zr.exe",
+      "sha256": "REPLACE_WITH_SHA256",
+      "enforceLocalOnly": false,
+      "search": {
+        "patterns": [
+          "7zr",
+          "7zr*",
+          "7zr.exe"
+        ],
+        "extensions": [
+          ".exe"
+        ]
+      }
+    }
+  },
+  "dependencySearch": {
+    "paths": [
+      "<Self>",
+      "<Downloads>"
+    ]
+  },
+  "services": {
+    "hsqldb": {
+      "serviceName": "HSQLDB",
+      "displayName": "HSQLDB Database",
+      "dependsOn": [],
+      "procrunExe": "<Install Root>\\procrun\\prunsrv.exe",
+      "delayedAutoStart": true,
+      "recovery": {
+        "enabled": true,
+        "resetSeconds": 86400,
+        "attempts": 3,
+        "restartDelayMs": 10000
+      },
+      "jreHome": "<Install Root>\\jre",
+      "classpath": "<Install Root>\\hsqldb\\lib\\hsqldb.jar",
+      "startClass": "org.hsqldb.server.Server",
+      "startParams": [
+        "-database.0=file:<Install Root>\\hsqldb\\data\\db0",
+        "-dbname.0=db0",
+        "-port=${DatabasePort}"
+      ],
+      "stopClass": "org.hsqldb.server.ShutdownServer",
+      "stopParams": [
+        "-port=${DatabasePort}"
+      ]
+    },
+    "iCameraProxy": {
+      "serviceName": "iCameraProxy",
+      "displayName": "iCamera Proxy",
+      "dependsOn": [
+        "HSQLDB"
+      ],
+      "procrunExe": "<Install Root>\\procrun\\prunsrv.exe",
+      "delayedAutoStart": true,
+      "recovery": {
+        "enabled": true,
+        "resetSeconds": 86400,
+        "attempts": 3,
+        "restartDelayMs": 15000
+      },
+      "env": {
+        "ICAMERA_PROXY_HOME": "<Install Root>\\proxy",
+        "FFMPEG_HOME": "<Install Root>\\ffmpeg"
+      },
+      "jvmOptions": {
+        "initialHeapSize": "256m",
+        "maximumHeapSize": "1024m",
+        "customParameters": [
+          "-XX:+UseG1GC",
+          "-XX:MaxGCPauseMillis=200",
+          "-Djava.awt.headless=true",
+          "-Dfile.encoding=UTF-8"
+        ],
+        "systemProperties": {
+          "proxy_home": "<Install Root>\\proxy",
+          "logback.configurationFile": "<Install Root>\\proxy\\logback.xml",
+          "db.port": "${DatabasePort}"
+        }
+      },
+      "mainClass": "com.example.icamera.Main",
+      "classpath": "<Install Root>\\proxy\\CameraProxy.jar",
+      "args": []
+    }
+  },
+  "tasks": {
+    "hsqldbTask": {
+      "name": "HSQLDB",
+      "delay": "PT0S"
+    },
+    "icameraTask": {
+      "name": "iCameraProxy",
+      "delay": "PT30S"
+    }
+  },
+  "customCommands": {
+    "preInstall": [
+      {
+        "command": "powershell.exe",
+        "arguments": [
+          "-Command",
+          "Write-Host 'Starting iCamera Proxy installation...'"
+        ],
+        "description": "Display installation start message",
+        "workingDirectory": "",
+        "continueOnError": true
+      }
+    ],
+    "postInstall": [
+      {
+        "command": "powershell.exe",
+        "arguments": [
+          "-Command",
+          "Get-Service -Name 'iCameraProxy','HSQLDB' | Format-Table -AutoSize"
+        ],
+        "description": "Display service status",
+        "workingDirectory": "<Install Root>",
+        "continueOnError": true
+      }
+    ]
+  },
+  "uninstall": {
+    "filecatalystUninstall": {
+      "command": "%ProgramFiles(x86)%\\FileCatalyst\\HotFolder\\unins000.exe",
+      "arguments": [
+        "/VERYSILENT",
+        "/NORESTART"
+      ]
+    },
+    "registry": {
+      "uninstallKeyName": "iCameraProxy"
+    }
+  }
+}
