@@ -903,15 +903,27 @@ function Register-WindowsService {
     elseif ($svc.PSObject.Properties['mainClass']) { $startClass = $svc.mainClass }
     if (-not $startClass) { throw "Service '$name' is missing startClass/mainClass in configuration." }
 
+    # If service already exists, stop and delete it to support re-install
+    try {
+        $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Log WARN "Service $name already exists. Replacing it."
+            try { if ($existing.Status -ne 'Stopped') { Write-Log INFO "Stopping existing service $name"; Stop-Service -Name $name -Force -ErrorAction SilentlyContinue } } catch {}
+            try { sc.exe delete "$name" | Out-Null } catch {}
+            # wait briefly until it's gone
+            $tries = 0; while ($tries -lt 20) { Start-Sleep -Milliseconds 250; $tries++; if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { break } }
+        }
+    } catch {}
+
     $common = @("//IS//$name",
         "--DisplayName=$($svc.displayName)",
         "--StartMode=Java",
         "--JavaHome=$jreHome",
         "--StartClass=$startClass")
-    if ($svc.classpath) { $common += "--Classpath=$(Replace-Tokens -Text $svc.classpath)" }
-    if ($svc.startParams) { $common += "--StartParams=" + (($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
-    if ($svc.stopClass) { $common += "--StopMode=Java","--StopClass=$($svc.stopClass)" }
-    if ($svc.stopParams) { $common += "--StopParams=" + (($svc.stopParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
+    if ($svc.PSObject.Properties['classpath'] -and $svc.classpath) { $common += "--Classpath=$(Replace-Tokens -Text $svc.classpath)" }
+    if ($svc.PSObject.Properties['startParams'] -and $svc.startParams) { $common += "--StartParams=" + (($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
+    if ($svc.PSObject.Properties['stopClass'] -and $svc.stopClass) { $common += "--StopMode=Java","--StopClass=$($svc.stopClass)" }
+    if ($svc.PSObject.Properties['stopParams'] -and $svc.stopParams) { $common += "--StopParams=" + (($svc.stopParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
     if ($svc.dependsOn) { $common += "--DependsOn=" + (($svc.dependsOn) -join ',') }
     # iCamera JVM & ENV handling (guard for missing properties)
     if ($svc.PSObject.Properties['jvmOptions']) { $common += "--JvmOptions=$(Build-JvmOptionsString -jvm $svc.jvmOptions)" }
@@ -923,7 +935,8 @@ function Register-WindowsService {
     }
     $common += '--Startup=automatic','--LogPath=' + (Join-Path $script:InstallRoot 'logs')
     Write-Log INFO "Registering Windows service $name"
-    Start-Process -FilePath $prunsrv -ArgumentList ($common -join ' ') -Wait -NoNewWindow | Out-Null
+    $p = Start-Process -FilePath $prunsrv -ArgumentList ($common -join ' ') -Wait -NoNewWindow -PassThru
+    if ($p.ExitCode -ne 0) { throw "Apache Commons Daemon procrun failed with exit value: $($p.ExitCode) (failed to install service)" }
     # Optional: configure delayed auto-start
     if ($svc.PSObject.Properties['delayedAutoStart'] -and $svc.delayedAutoStart) {
         try {
@@ -957,14 +970,22 @@ function Register-ScheduledTaskEquivalent {
     $jre = Resolve-JavaExe -Root (Join-Path $script:InstallRoot 'jre')
     $actionArgs = @()
     if ($svc.PSObject.Properties['jvmOptions']) { $actionArgs += (Build-JvmOptionsString -jvm $svc.jvmOptions).Split(' ') }
-    if ($svc.classpath) { $actionArgs += '-cp'; $actionArgs += (Replace-Tokens -Text $svc.classpath) }
+    if ($svc.PSObject.Properties['classpath'] -and $svc.classpath) { $actionArgs += '-cp'; $actionArgs += (Replace-Tokens -Text $svc.classpath) }
+    # Reinstall-safe: remove existing scheduled task if present
+    try {
+        $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Log WARN "Scheduled task $taskName already exists. Replacing it."
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        }
+    } catch {}
     # Resolve start class for scheduled task as well
     $startClass2 = $null
     if ($svc.PSObject.Properties['startClass']) { $startClass2 = $svc.startClass }
     elseif ($svc.PSObject.Properties['mainClass']) { $startClass2 = $svc.mainClass }
     if (-not $startClass2) { throw "Scheduled Task action missing startClass/mainClass for service '$name'" }
     $actionArgs += $startClass2
-    if ($svc.startParams) { $actionArgs += ($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) }
+    if ($svc.PSObject.Properties['startParams'] -and $svc.startParams) { $actionArgs += ($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) }
     $argLine = ($actionArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
     $trigger = New-ScheduledTaskTrigger -AtStartup
     if ($delayISO) { $trigger.Delay = $delayISO }
