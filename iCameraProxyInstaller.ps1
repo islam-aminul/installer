@@ -23,6 +23,32 @@ $ErrorActionPreference = 'Stop'
 # =============================
 $script:BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Path $PSCommandPath -Parent } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Path $MyInvocation.MyCommand.Path -Parent } else { (Get-Location).Path }
 
+# Ensure FFmpeg layout is <Root>\bin\ffmpeg.exe. If extraction created a nested version folder, flatten it.
+function Normalize-FfmpegLayout {
+    param([Parameter(Mandatory=$true)][string]$Root)
+    try {
+        $exe = Join-Path $Root 'bin\ffmpeg.exe'
+        if (Test-Path -LiteralPath $exe) { return }
+        # look for a single top-level folder that contains bin\ffmpeg.exe
+        $topDirs = Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue
+        if ($topDirs.Count -eq 1) {
+            $inner = $topDirs[0].FullName
+            $innerExe = Join-Path $inner 'bin\ffmpeg.exe'
+            if (Test-Path -LiteralPath $innerExe) {
+                Write-Log INFO ("Normalizing FFmpeg layout by flattening '{0}' into '{1}'" -f $inner, $Root)
+                Get-ChildItem -LiteralPath $inner -Force | ForEach-Object {
+                    $dest = Join-Path $Root $_.Name
+                    if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue }
+                    Move-Item -LiteralPath $_.FullName -Destination $Root -Force
+                }
+                Remove-Item -LiteralPath $inner -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Log WARN ("FFmpeg normalization skipped: {0}" -f $_.Exception.Message)
+    }
+}
+
 # 7-Zip helpers for extracting .7z archives
 function Get-SevenZipPath {
     # Try common locations and tools folder
@@ -36,9 +62,10 @@ function Get-SevenZipPath {
 }
 
 function Ensure-SevenZip {
+    if ($script:SevenZipEnsured -and $script:SevenZipPath -and (Test-Path -LiteralPath $script:SevenZipPath)) { return $script:SevenZipPath }
     if (-not (Test-Path -LiteralPath $script:ToolsDir)) { New-Item -ItemType Directory -Path $script:ToolsDir -Force | Out-Null }
     $path = Get-SevenZipPath
-    if ($path) { return $path }
+    if ($path) { $script:SevenZipEnsured = $true; $script:SevenZipPath = $path; return $path }
     # Acquire 7zr.exe using the standard dependency mechanism, only if needed
     $portableUrl = $null
     $sha256 = $null
@@ -66,9 +93,9 @@ function Ensure-SevenZip {
     $ok = Ensure-Dependency -dep $dep
     if ($ok) {
         $sevenZr = Join-Path $script:ToolsDir '7zr.exe'
-        if (Test-Path -LiteralPath $sevenZr) { return $sevenZr }
+        if (Test-Path -LiteralPath $sevenZr) { $script:SevenZipEnsured = $true; $script:SevenZipPath = $sevenZr; return $sevenZr }
         $path = Get-SevenZipPath
-        if ($path) { return $path }
+        if ($path) { $script:SevenZipEnsured = $true; $script:SevenZipPath = $path; return $path }
     }
     return $null
 }
@@ -80,7 +107,9 @@ function Expand-7ZipArchive {
     if (-not $sevenZip) { throw '7-Zip is required to extract .7z archives but could not be installed.' }
     if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
     Write-Log INFO "Extracting 7z archive to $Destination using: $sevenZip"
-    & $sevenZip 'x' '-y' ("-o{0}" -f $Destination) $Archive | Out-Null
+    $args = @('x','-y',("-o{0}" -f $Destination), $Archive)
+    $proc = Start-Process -FilePath $sevenZip -ArgumentList $args -NoNewWindow -PassThru -Wait
+    if ($proc.ExitCode -ne 0) { throw ("7-Zip extraction failed with exit code {0}" -f $proc.ExitCode) }
 }
 
 function Show-LocateOrDownloadDialog {
@@ -138,6 +167,9 @@ $script:LogPath = $null
 $script:InstallRoot = $null
 $script:SelectedDrive = 'C:'
 $script:ToolsDir = Join-Path $script:BaseDir 'tools'
+# Cache for 7-Zip to avoid repeated ensure attempts across multiple .7z dependencies
+$script:SevenZipEnsured = $false
+$script:SevenZipPath = $null
 $script:DatabasePort = $null
 $script:FileCatalystINF = Join-Path $script:BaseDir 'filecatalyst_hotfolder.inf'
 $script:SkipShaChecks = $false
@@ -644,6 +676,20 @@ function Ensure-Dependency {
     )) {
         Normalize-JreLayout -Root $target
     }
+    # Normalize FFmpeg layout if this dependency is FFmpeg
+    if ($dep -and (
+        ($dep.target -and ($dep.target -like '*\\ffmpeg')) -or
+        ($dep.name -and ($dep.name -match '(?i)ffmpeg'))
+    )) {
+        Normalize-FfmpegLayout -Root $target
+        $ffexe = Join-Path $target 'bin\ffmpeg.exe'
+        if (Test-Path -LiteralPath $ffexe) {
+            Write-Log SUCCESS "FFmpeg ready: $ffexe"
+        } else {
+            Write-Log ERROR "FFmpeg not found after extraction. Expected: $ffexe"
+            return $false
+        }
+    }
     # Keep the downloaded file in self folder as requested; do not delete
     return $true
 }
@@ -851,11 +897,17 @@ function Register-WindowsService {
     # Ensure service log directory exists (avoid system32 fallback)
     $serviceLogDir = Join-Path $script:InstallRoot 'logs'
     if (-not (Test-Path -LiteralPath $serviceLogDir)) { New-Item -ItemType Directory -Path $serviceLogDir -Force | Out-Null }
+    # Resolve start class (support both startClass and mainClass)
+    $startClass = $null
+    if ($svc.PSObject.Properties['startClass']) { $startClass = $svc.startClass }
+    elseif ($svc.PSObject.Properties['mainClass']) { $startClass = $svc.mainClass }
+    if (-not $startClass) { throw "Service '$name' is missing startClass/mainClass in configuration." }
+
     $common = @("//IS//$name",
         "--DisplayName=$($svc.displayName)",
         "--StartMode=Java",
         "--JavaHome=$jreHome",
-        "--StartClass=$($svc.startClass)")
+        "--StartClass=$startClass")
     if ($svc.classpath) { $common += "--Classpath=$(Replace-Tokens -Text $svc.classpath)" }
     if ($svc.startParams) { $common += "--StartParams=" + (($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
     if ($svc.stopClass) { $common += "--StopMode=Java","--StopClass=$($svc.stopClass)" }
@@ -906,7 +958,12 @@ function Register-ScheduledTaskEquivalent {
     $actionArgs = @()
     if ($svc.PSObject.Properties['jvmOptions']) { $actionArgs += (Build-JvmOptionsString -jvm $svc.jvmOptions).Split(' ') }
     if ($svc.classpath) { $actionArgs += '-cp'; $actionArgs += (Replace-Tokens -Text $svc.classpath) }
-    $actionArgs += $svc.startClass
+    # Resolve start class for scheduled task as well
+    $startClass2 = $null
+    if ($svc.PSObject.Properties['startClass']) { $startClass2 = $svc.startClass }
+    elseif ($svc.PSObject.Properties['mainClass']) { $startClass2 = $svc.mainClass }
+    if (-not $startClass2) { throw "Scheduled Task action missing startClass/mainClass for service '$name'" }
+    $actionArgs += $startClass2
     if ($svc.startParams) { $actionArgs += ($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) }
     $argLine = ($actionArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
     $trigger = New-ScheduledTaskTrigger -AtStartup
