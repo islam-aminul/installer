@@ -23,6 +23,30 @@ $ErrorActionPreference = 'Stop'
 # =============================
 $script:BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Path $PSCommandPath -Parent } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Path $MyInvocation.MyCommand.Path -Parent } else { (Get-Location).Path }
 
+# UI prompt helper for choices (Yes/No)
+function Show-YesNoDialog {
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [string]$Title = 'iCamera Proxy Installer',
+        [ValidateSet('Yes','No')][string]$Default = 'Yes'
+    )
+    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop } catch {}
+    try {
+        $defaultBtn = if ($Default -eq 'Yes') { [System.Windows.Forms.MessageBoxDefaultButton]::Button1 } else { [System.Windows.Forms.MessageBoxDefaultButton]::Button2 }
+        $res = [System.Windows.Forms.MessageBox]::Show(
+            $Message,
+            $Title,
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question,
+            $defaultBtn
+        )
+        return ($res -eq [System.Windows.Forms.DialogResult]::Yes)
+    } catch {
+        # fallback: no UI available
+        return $null
+    }
+}
+
 # Ensure FFmpeg layout is <Root>\bin\ffmpeg.exe. If extraction created a nested version folder, flatten it.
 function Normalize-FfmpegLayout {
     param([Parameter(Mandatory=$true)][string]$Root)
@@ -182,7 +206,14 @@ function Write-Log {
     )
     $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $line = "[$ts][$($Level.ToUpper())] $Message"
-    if (-not $script:IsQuiet -or $Level -in @('ERROR','WARN','SUCCESS')) { Write-Host $line }
+    $color = switch ($Level.ToUpper()) {
+        'INFO' { 'Gray' }
+        'WARN' { 'Yellow' }
+        'ERROR' { 'Red' }
+        'SUCCESS' { 'Green' }
+        default { 'White' }
+    }
+    if (-not $script:IsQuiet -or $Level -in @('ERROR','WARN','SUCCESS')) { Write-Host $line -ForegroundColor $color }
     if ($script:LogPath) { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 }
 }
 
@@ -339,7 +370,8 @@ function Test-SystemPrereqs {
             $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -Method Head -TimeoutSec 15
             if (-not $resp) { throw "No response" }
         } catch {
-            throw "Network check failed for ${url}: $($_.Exception.Message)"
+            Write-Log WARN ("Network check failed for ${url}: $($_.Exception.Message)")
+            continue
         }
     }
 }
@@ -708,44 +740,69 @@ function Configure-HSQLDB {
     if (-not $hs) { throw 'HSQLDB dependency not configured.' }
     $ok = Ensure-Dependency -dep $hs
     if (-not $ok) { throw 'HSQLDB dependency acquisition failed.' }
-    $dbName = $hs.dbName
+    $dbName = if ($hs.dbName) { $hs.dbName } else { 'db0' }
     $portRange = $hs.portRange
     $script:DatabasePort = Find-AvailablePort -Start $portRange.start -End $portRange.end
     Write-Log INFO "Selected HSQLDB port: $script:DatabasePort"
     $hsRoot = Replace-Tokens -Text $hs.target
     $dataDir = Join-Path $hsRoot 'data'
     if (-not (Test-Path -LiteralPath $dataDir)) { New-Item -ItemType Directory -Path $dataDir -Force | Out-Null }
-    # server.properties
+    # server.properties (file-based database ensures state persisted on disk while data served in-memory)
     $serverProps = @(
         "server.database.0=file:$dataDir\$dbName",
         "server.dbname.0=$dbName",
-        "server.port=$script:DatabasePort"
+        "server.port=$script:DatabasePort",
+        "server.silent=true",
+        "server.no_system_exit=true"
     )
     Set-Content -LiteralPath (Join-Path $hsRoot 'server.properties') -Value $serverProps -Encoding ASCII
-    # sqltool.rc (use configured dbName; HSQLDB expects space-separated rc syntax)
-    $sqltool = @("urlid $dbName jdbc:hsqldb:hsql://localhost:$script:DatabasePort/$dbName user=SA password=")
-    Set-Content -LiteralPath (Join-Path $hsRoot 'sqltool.rc') -Value $sqltool -Encoding ASCII
-    # Initialize DB using sqltool if scripts provided
-    if ($hs.sqlInitScripts) {
-        $sqltoolJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'sqltool*.jar' | Select-Object -First 1
-        $hsqldbJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'hsqldb*.jar' | Select-Object -First 1
-        if ($sqltoolJar -and $hsqldbJar) {
-            Write-Log INFO 'Initializing HSQLDB database with SQL scripts.'
-            $rcFile = Join-Path $hsRoot 'sqltool.rc'
-            Write-Log INFO ("Using sqltool.rc: {0}" -f (Get-Content -LiteralPath $rcFile -ErrorAction SilentlyContinue | Select-Object -First 1))
+    # Create sqltool.rc entries for both file and server modes (per HSQLDB format)
+    $dataDirUnix = ($dataDir -replace '\\','/')
+    $rcPath = Join-Path $hsRoot 'sqltool.rc'
+    $rcContent = @(
+        "urlid ${dbName}_file",
+        "url jdbc:hsqldb:file:$dataDirUnix/$dbName",
+        "username SA",
+        "password",
+        "",
+        "urlid ${dbName}_server",
+        "url jdbc:hsqldb:hsql://localhost:$script:DatabasePort/$dbName",
+        "username SA",
+        "password"
+    )
+    Set-Content -LiteralPath $rcPath -Value $rcContent -Encoding ASCII
+    
+    # Initialize DB files using file mode (creates $dbName.* files on disk even without server running)
+    $sqltoolJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'sqltool*.jar' | Select-Object -First 1
+    $hsqldbJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'hsqldb*.jar' | Select-Object -First 1
+    if ($sqltoolJar -and $hsqldbJar) {
+        $javaExe = Resolve-JavaExe -Root (Join-Path $script:InstallRoot 'jre')
+        $classpath = "$($hsqldbJar.FullName);$($sqltoolJar.FullName)"
+        $bootstrapSql = Join-Path $hsRoot 'bootstrap.sql'
+        $bootstrap = @(
+            'CREATE TABLE IF NOT EXISTS ICAMERA_TEST(ID INTEGER PRIMARY KEY, NAME VARCHAR(64));',
+            'SET DATABASE SQL SYNTAX MYS TRUE;',
+            'SHUTDOWN;'
+        )
+        Set-Content -LiteralPath $bootstrapSql -Value $bootstrap -Encoding ASCII
+        Write-Log INFO 'Bootstrapping HSQLDB file database to create initial db files.'
+        & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool "--rcFile=$rcPath" "${dbName}_file" $bootstrapSql
+        Remove-Item -LiteralPath $bootstrapSql -Force -ErrorAction SilentlyContinue
+        
+        # Run additional init scripts if configured (against file DB)
+        if ($hs.sqlInitScripts) {
+            Write-Log INFO 'Running configured SQL initialization scripts for HSQLDB.'
             foreach ($scriptPath in $hs.sqlInitScripts) {
                 $resolved = Replace-Tokens -Text $scriptPath
                 if (Test-Path -LiteralPath $resolved) {
-                    $javaExe = Resolve-JavaExe -Root (Join-Path $script:InstallRoot 'jre')
-                    $classpath = "$($hsqldbJar.FullName);$($sqltoolJar.FullName)"
-                    & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool "--rcFile=$rcFile" $dbName $resolved
+                    & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool "--rcFile=$rcPath" "${dbName}_file" $resolved
                 } else {
                     Write-Log WARN "SQL init script not found: $resolved"
                 }
             }
-        } else {
-            Write-Log WARN 'sqltool.jar or hsqldb.jar not found; skipping DB initialization.'
         }
+    } else {
+        Write-Log WARN 'sqltool.jar or hsqldb.jar not found; skipping DB initialization.'
     }
 }
 
@@ -782,11 +839,19 @@ function Install-FileCatalystHotFolder {
     # Helper to build args with replaced INF path
     function _Build-ArgsWithInf([string[]]$args, [string]$switch) {
         $out = @()
-        foreach ($a in ($args | ForEach-Object { Replace-Tokens -Text $_ })) {
-            if ($a -match ("^(?i)(/|-)" + [regex]::Escape($switch) + "(?::|=)?")) {
-                $a = ('/{0}="{1}"' -f $switch, $infPath)
+        $matched = $false
+        if ($args -and $args.Count -gt 0) {
+            foreach ($a in ($args | ForEach-Object { Replace-Tokens -Text $_ })) {
+                if ($a -match ("^(?i)(/|-)" + [regex]::Escape($switch) + "(?::|=)?")) {
+                    $a = ('/{0}="{1}"' -f $switch, $infPath)
+                    $matched = $true
+                }
+                $out += $a
             }
-            $out += $a
+        }
+        if (-not $matched) {
+            # Ensure the INF switch is present even if not provided in config args
+            $out += ('/{0}="{1}"' -f $switch, $infPath)
         }
         return ($out -join ' ')
     }
@@ -800,18 +865,24 @@ function Install-FileCatalystHotFolder {
         } catch {}
         $detectedDir = $null
         if ($dirLine -and $dirLine -match '^(?i)Dir=(.+)$') { $detectedDir = $Matches[1].Trim() }
-        $prompt = "Found previous FileCatalyst configuration: `nINF: $infPath`nInstall Dir: ${detectedDir}`nChoose: [1] Reinstall using previous configuration (silent)  [2] Reinstall without previous configuration (standard).`nEnter 1 or 2 [1]: "
-        $choice = Read-Host -Prompt $prompt
-        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq '1') { $useExisting = $true }
+        $uiMsg = "Found previous FileCatalyst configuration:`r`nINF: $infPath`r`nInstall Dir: ${detectedDir}`r`n`r`nChoose an option:`r`nYes = Reinstall using previous configuration (silent)`r`nNo  = Reinstall without previous configuration (standard)"
+        $useExisting = $true # default to reuse
+        if (-not $script:IsQuiet) {
+            $ans = Show-YesNoDialog -Message $uiMsg -Title 'FileCatalyst HotFolder' -Default 'Yes'
+            if ($ans -ne $null) { $useExisting = [bool]$ans }
+        }
+        Write-Log INFO ("FileCatalyst choice: " + ($(if ($useExisting) { 'Reuse previous (LOADINF)' } else { 'Reinstall fresh (SAVEINF)' })))
     }
 
     if ($useExisting) {
         $loadArgs = _Build-ArgsWithInf -args $fc.loadInfArgs -switch 'LOADINF'
+        if ([string]::IsNullOrWhiteSpace($loadArgs)) { $loadArgs = ('/LOADINF="{0}"' -f $infPath) }
         Write-Log INFO "Running FileCatalyst HotFolder LOADINF: $loadArgs (wd=$script:BaseDir)"
         $p = Start-Process -FilePath $exePath -ArgumentList $loadArgs -WorkingDirectory $script:BaseDir -Wait -PassThru
         if ($p.ExitCode -ne 0) { Write-Log WARN ("FileCatalyst LOADINF exited with code {0}" -f $p.ExitCode) }
     } else {
         $saveArgs = _Build-ArgsWithInf -args $fc.saveInfArgs -switch 'SAVEINF'
+        if ([string]::IsNullOrWhiteSpace($saveArgs)) { $saveArgs = ('/SAVEINF="{0}"' -f $infPath) }
         Write-Log INFO "Running FileCatalyst HotFolder SAVEINF (standard install): $saveArgs (wd=$script:BaseDir)"
         $p = Start-Process -FilePath $exePath -ArgumentList $saveArgs -WorkingDirectory $script:BaseDir -Wait -PassThru
         if ($p.ExitCode -ne 0) { Write-Log WARN ("FileCatalyst SAVEINF exited with code {0}" -f $p.ExitCode) }
@@ -1154,10 +1225,18 @@ function Uninstall-Application {
         $key = 'HKCU:SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' + $script:Config.uninstall.registry.uninstallKeyName
         if (Test-Path $key) { Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue }
         Write-Log SUCCESS 'Uninstallation completed.'
-        exit 0
+        if (-not $script:IsQuiet) {
+            Read-Host 'Press Enter to close...'
+        } else {
+            exit 0
+        }
     } catch {
         Write-Log ERROR "Uninstallation failed: $($_.Exception.Message)"
-        exit 1
+        if (-not $script:IsQuiet) {
+            Read-Host 'Press Enter to close...'
+        } else {
+            exit 1
+        }
     }
 }
 
@@ -1194,11 +1273,6 @@ try {
         if (-not (Ensure-Dependency -dep $script:Config.dependencies.procrun)) { $depFailures += 'Apache Procrun'; }
     }
 
-    # Optional dependency: FileCatalyst HotFolder (do not fail install)
-    if ($script:Config.dependencies.filecatalyst) {
-        try { Install-FileCatalystHotFolder } catch { Write-Log WARN "FileCatalyst HotFolder installation skipped/failed: $($_.Exception.Message)" }
-    }
-
     # Exit early if required dependencies failed
     if ($depFailures.Count -gt 0) {
         $msg = "The following required dependencies were not installed: " + ($depFailures -join ', ') + ". Installation will now exit."
@@ -1216,6 +1290,11 @@ try {
     # Now that DatabasePort is known, update properties
     Update-ApplicationProperties
 
+    # Optional dependency: FileCatalyst HotFolder (do not fail install)
+    if ($script:Config.dependencies.filecatalyst) {
+        try { Install-FileCatalystHotFolder } catch { Write-Log WARN "FileCatalyst HotFolder installation skipped/failed: $($_.Exception.Message)" }
+    }
+
     # Services / Tasks
     Register-ServicesOrTasks
 
@@ -1225,12 +1304,20 @@ try {
     Invoke-PostInstallCommands
 
     Write-Log SUCCESS 'Installation completed successfully.'
-    exit 0
+    if (-not $script:IsQuiet) {
+        Read-Host 'Press Enter to close...'
+    } else {
+        exit 0
+    }
 } catch {
     $fatal = "Installation failed: {0}" -f $_.Exception.Message
     Write-Log ERROR $fatal
     Show-ErrorDialog -Message $fatal
-    exit 1
+    if (-not $script:IsQuiet) {
+        Read-Host 'Press Enter to close...'
+    } else {
+        exit 1
+    }
 } finally {
     Remove-InstallerLock
 }

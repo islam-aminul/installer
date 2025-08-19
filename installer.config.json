@@ -26,7 +26,7 @@
         "dest": "<Install Root>\\proxy\\"
       },
       {
-        "source": "cameraproxy.properties",
+        "source": "proxy-details.properties",
         "dest": "<Install Root>\\proxy\\"
       },
       {
@@ -40,7 +40,7 @@
     ],
     "properties": {
       "cameraproxy": {
-        "file": "<Install Root>\\proxy\\cameraproxy.properties",
+        "file": "<Install Root>\\proxy\\proxy-details.properties",
         "keys": {
           "dbPort": "db.port",
           "fileCatalystHotFolders": "filecatalyst.hot_folders",
