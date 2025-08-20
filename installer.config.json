@@ -99,7 +99,7 @@
     },
     "hsqldb": {
       "name": "HSQLDB",
-      "url": "https://downloads.sourceforge.net/project/hsqldb/hsqldb/hsqldb_2_7/hsqldb-2.7.4.zip",
+      "url": "https://downloads.sourceforge.net/project/hsqldb/hsqldb/hsqldb_2_5/hsqldb-2.5.1.zip",
       "sha256": "REPLACE_WITH_SHA256",
       "target": "<Install Root>\\hsqldb",
       "enforceLocalOnly": false,
@@ -117,13 +117,13 @@
       ],
       "postInstallQueries": {
         "displayInfo": {
-          "description": "Display installation summary information",
+          "description": "Installation summary information",
           "sql": "SELECT COUNT(*) as config_count FROM config_table;"
         },
         "fileCatalystDecision": {
-          "description": "Check if FileCatalyst HotFolder should be installed",
-          "sql": "SELECT COUNT(*) as config_count FROM config_table;",
-          "installCondition": "config_count > 0"
+          "description": "FileCatalyst HotFolder should be installed",
+          "sql": "SELECT COUNT(*) as recording_utility_adapter_present FROM config_table WHERE config_name LIKE 'default_config1';",
+          "installCondition": "recording_utility_adapter_present > 0"
         }
       },
       "sqltoolConfig": {
@@ -196,8 +196,8 @@
   },
   "services": {
     "hsqldb": {
-      "serviceName": "HSQLDB",
-      "displayName": "HSQLDB Database",
+      "serviceName": "iCamera-HSQLDB",
+      "displayName": "iCamera-Database",
       "dependsOn": [],
       "procrunExe": "<Install Root>\\procrun\\prunsrv.exe",
       "delayedAutoStart": true,
@@ -211,20 +211,18 @@
       "classpath": "<Install Root>\\hsqldb\\lib\\hsqldb.jar",
       "startClass": "org.hsqldb.server.Server",
       "startParams": [
-        "-database.0=file:<Install Root>\\hsqldb\\data\\db0",
-        "-dbname.0=db0",
-        "-port=${DatabasePort}"
+        "--props=<Install Root>\\hsqldb\\server.properties"
       ],
       "stopClass": "org.hsqldb.server.ShutdownServer",
       "stopParams": [
-        "-port=${DatabasePort}"
+        "--props=<Install Root>\\hsqldb\\server.properties"
       ]
     },
     "iCameraProxy": {
-      "serviceName": "iCameraProxy",
-      "displayName": "iCamera Proxy",
+      "serviceName": "iCamera-PROXY",
+      "displayName": "iCamera-Proxy",
       "dependsOn": [
-        "HSQLDB"
+        "iCamera-HSQLDB"
       ],
       "procrunExe": "<Install Root>\\procrun\\prunsrv.exe",
       "delayedAutoStart": true,
@@ -236,7 +234,7 @@
       },
       "env": {
         "ICAMERA_PROXY_HOME": "<Install Root>\\proxy",
-        "FFMPEG_HOME": "<Install Root>\\ffmpeg"
+        "FFMPEG_HOME": "<Install Root>\\ffmpeg\\bin"
       },
       "jvmOptions": {
         "initialHeapSize": "256m",
@@ -274,9 +272,9 @@
         "command": "powershell.exe",
         "arguments": [
           "-Command",
-          "Write-Host 'Starting iCamera Proxy installation...'"
+          "Write-Host ('Installation started at: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))"
         ],
-        "description": "Display installation start message",
+        "description": "Display installation start time",
         "workingDirectory": "",
         "continueOnError": true
       }
@@ -286,10 +284,10 @@
         "command": "powershell.exe",
         "arguments": [
           "-Command",
-          "Get-Service -Name 'iCameraProxy','HSQLDB' | Format-Table -AutoSize"
+          "Write-Host ('Installation completed at: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))"
         ],
-        "description": "Display service status",
-        "workingDirectory": "<Install Root>",
+        "description": "Display installation end time",
+        "workingDirectory": "",
         "continueOnError": true
       }
     ]

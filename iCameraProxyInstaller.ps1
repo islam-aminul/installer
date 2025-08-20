@@ -28,18 +28,45 @@ function Show-YesNoDialog {
     param(
         [Parameter(Mandatory=$true)][string]$Message,
         [string]$Title = 'iCamera Proxy Installer',
-        [ValidateSet('Yes','No')][string]$Default = 'Yes'
+        [ValidateSet('Yes','No')][string]$Default = 'Yes',
+        [string]$YesText = 'Keep Settings',
+        [string]$NoText = 'Fresh Install'
     )
     try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop } catch {}
     try {
-        $defaultBtn = if ($Default -eq 'Yes') { [System.Windows.Forms.MessageBoxDefaultButton]::Button1 } else { [System.Windows.Forms.MessageBoxDefaultButton]::Button2 }
-        $res = [System.Windows.Forms.MessageBox]::Show(
-            $Message,
-            $Title,
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Question,
-            $defaultBtn
-        )
+        # Create custom form with action-based button text
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = $Title
+        $form.Size = New-Object System.Drawing.Size(400, 200)
+        $form.StartPosition = 'CenterScreen'
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+        
+        $label = New-Object System.Windows.Forms.Label
+        $label.Location = New-Object System.Drawing.Point(10, 10)
+        $label.Size = New-Object System.Drawing.Size(360, 80)
+        $label.Text = $Message -replace '`r`n', [Environment]::NewLine
+        $form.Controls.Add($label)
+        
+        $yesButton = New-Object System.Windows.Forms.Button
+        $yesButton.Location = New-Object System.Drawing.Point(80, 110)
+        $yesButton.Size = New-Object System.Drawing.Size(100, 30)
+        $yesButton.Text = $YesText
+        $yesButton.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+        $form.Controls.Add($yesButton)
+        
+        $noButton = New-Object System.Windows.Forms.Button
+        $noButton.Location = New-Object System.Drawing.Point(200, 110)
+        $noButton.Size = New-Object System.Drawing.Size(100, 30)
+        $noButton.Text = $NoText
+        $noButton.DialogResult = [System.Windows.Forms.DialogResult]::No
+        $form.Controls.Add($noButton)
+        
+        if ($Default -eq 'Yes') { $form.AcceptButton = $yesButton } else { $form.AcceptButton = $noButton }
+        $form.CancelButton = $noButton
+        
+        $res = $form.ShowDialog()
         return ($res -eq [System.Windows.Forms.DialogResult]::Yes)
     } catch {
         # fallback: no UI available
@@ -725,7 +752,7 @@ function Ensure-Dependency {
         Normalize-FfmpegLayout -Root $target
         $ffexe = Join-Path $target 'bin\ffmpeg.exe'
         if (Test-Path -LiteralPath $ffexe) {
-            Write-Log SUCCESS "FFmpeg ready: $ffexe"
+            Write-Log INFO "FFmpeg ready: $ffexe"
         } else {
             Write-Log ERROR "FFmpeg not found after extraction. Expected: $ffexe"
         }
@@ -760,12 +787,12 @@ function Normalize-HsqldbLayout {
             # Move contents from nested hsqldb directory to root
             $items = Get-ChildItem -LiteralPath $innerHsqldbDir -ErrorAction SilentlyContinue
             foreach ($item in $items) {
-                $destPath = Join-Path $Root $item.Name
-                if (Test-Path -LiteralPath $destPath) {
+                $dest = Join-Path $Root $item.Name
+                if (Test-Path -LiteralPath $dest) {
                     Write-Log WARN "Destination already exists, skipping: $($item.Name)"
                     continue
                 }
-                Move-Item -LiteralPath $item.FullName -Destination $destPath -Force -ErrorAction SilentlyContinue
+                Move-Item -LiteralPath $item.FullName -Destination $dest -Force -ErrorAction SilentlyContinue
             }
             
             # Remove the now-empty nested directory structure
@@ -779,7 +806,7 @@ function Normalize-HsqldbLayout {
     $sqltoolJar = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'sqltool*.jar' -ErrorAction SilentlyContinue | Select-Object -First 1
     
     if ($hsqldbJar -and $sqltoolJar) {
-        Write-Log SUCCESS "HSQLDB layout normalized. Found: $($hsqldbJar.Name), $($sqltoolJar.Name)"
+        Write-Log INFO "HSQLDB layout normalized. Found: $($hsqldbJar.Name), $($sqltoolJar.Name)"
     } else {
         Write-Log WARN "HSQLDB normalization completed but essential JAR files may be missing"
     }
@@ -899,7 +926,7 @@ function Configure-HSQLDB {
                 $scriptName = Split-Path -Leaf $resolved
                 $destPath = Join-Path $dataDir $scriptName
                 Copy-Item -LiteralPath $resolved -Destination $destPath -Force
-                Write-Log SUCCESS "Initialization script copied to database directory: $scriptName"
+                Write-Log INFO "Initialization script copied to database directory: $scriptName"
             } else {
                 Write-Log ERROR "Initialization script not found: $resolved"
                 throw "Database initialization script not found: $resolved"
@@ -942,7 +969,7 @@ function Configure-HSQLDB {
         Start-Sleep -Seconds 5
         try {
             # Test connection to verify server is running
-            & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool --rcFile="$rcPath" "localhost-sa" --sql="SELECT 1;" 2>&1 | Out-Null
+            & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool --rcFile="$rcPath" --sql="SELECT 1;" "localhost-sa" 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 Write-Log SUCCESS "HSQLDB server is running and accepting connections"
             } else {
@@ -971,7 +998,7 @@ function Configure-HSQLDB {
                         throw "Application database script failed: $resolved"
                     }
                 }
-                Write-Log SUCCESS "Application script executed successfully: $resolved"
+                Write-Log INFO "Application script executed successfully: $resolved"
             } else {
                 Write-Log ERROR "Application script not found: $resolved"
                 throw "Application database script not found: $resolved"
@@ -1015,14 +1042,12 @@ function Configure-HSQLDB {
     # Execute post-installation queries using direct URL connection
     if ($hs.postInstallQueries) {
         Write-Log INFO 'Executing post-installation database queries.'
-        $directUrl = "jdbc:hsqldb:file:$dbFilePathUnix;shutdown=true"
         
         foreach ($queryName in $hs.postInstallQueries.PSObject.Properties.Name) {
             $queryConfig = $hs.postInstallQueries.$queryName
             $querySql = $queryConfig.sql
             $description = if ($queryConfig.description) { $queryConfig.description } else { $queryName }
             
-            Write-Log INFO "Executing query: $description"
             $queryFile = Join-Path $hsRoot "postinstall_$queryName.sql"
             Set-Content -LiteralPath $queryFile -Value $querySql -Encoding ASCII
             
@@ -1030,18 +1055,17 @@ function Configure-HSQLDB {
             Remove-Item -LiteralPath $queryFile -Force -ErrorAction SilentlyContinue
             
             if ($LASTEXITCODE -eq 0) {
-                Write-Log SUCCESS "Query '$queryName' executed successfully"
                 if ($result -and $result.ToString().Trim()) {
-                    Write-Log INFO "Query result: $result"
+                    Write-Log INFO "$description : $result"
                 }
                 
                 # Check install condition for FileCatalyst decision
                 if ($queryName -eq 'fileCatalystDecision' -and $queryConfig.installCondition) {
                     if ($result -match 'TRUE') {
-                        Write-Log INFO 'FileCatalyst HotFolder installation recommended by database query.'
+                        Write-Log INFO 'FileCatalyst HotFolder installation recommended by application configuration.'
                         $script:ForceFileCatalystInstall = $true
                     } else {
-                        Write-Log INFO 'FileCatalyst HotFolder installation not recommended by database query.'
+                        Write-Log INFO 'FileCatalyst HotFolder installation not recommended by application configuration.'
                         $script:SkipFileCatalystInstall = $true
                     }
                 }
@@ -1051,12 +1075,31 @@ function Configure-HSQLDB {
         }
     }
     
-    Write-Log SUCCESS 'HSQLDB database initialization completed successfully.'
+    Write-Log INFO 'HSQLDB database initialization completed successfully.'
+    
+    # Shutdown the database server after initialization
+    try {
+        Write-Log INFO "Shutting down HSQLDB server"
+        & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool --rcFile="$rcPath" --sql="SHUTDOWN;" "localhost-sa" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log INFO "HSQLDB server shutdown completed"
+        } else {
+            Write-Log WARN "HSQLDB server shutdown may have failed, but continuing"
+        }
+    } catch {
+        Write-Log WARN "Failed to shutdown HSQLDB server: $($_.Exception.Message)"
+    }
 }
 
 function Install-FileCatalystHotFolder {
     $fc = $script:Config.dependencies.filecatalyst
     if (-not $fc) { Write-Log INFO 'FileCatalyst not configured.'; return }
+    
+    # Check if FileCatalyst installation should be skipped based on database query
+    if ($script:SkipFileCatalystInstall) {
+        Write-Log INFO 'FileCatalyst HotFolder installation skipped based on application configuration.'
+        return
+    }
     Ensure-Dependency -dep $fc
     # Discover installer EXE: prefer any .exe in target; fallback to URL filename in local folder
     $targetDir = Replace-Tokens -Text $fc.target
@@ -1113,7 +1156,7 @@ function Install-FileCatalystHotFolder {
         } catch {}
         $detectedDir = $null
         if ($dirLine -and $dirLine -match '^(?i)Dir=(.+)$') { $detectedDir = $Matches[1].Trim() }
-        $uiMsg = "Found previous FileCatalyst configuration:`r`nINF: $infPath`r`nInstall Dir: ${detectedDir}`r`n`r`nChoose an option:`r`nYes = Reinstall using previous configuration (silent)`r`nNo  = Reinstall without previous configuration (standard)"
+        $uiMsg = "Previous FileCatalyst installation found at:`r`n${detectedDir}`r`n`r`nHow would you like to proceed?`r`nKeep Settings = Use existing configuration (faster)`r`nFresh Install = Start with new configuration"
         $useExisting = $true # default to reuse
         if (-not $script:IsQuiet) {
             $ans = Show-YesNoDialog -Message $uiMsg -Title 'FileCatalyst HotFolder' -Default 'Yes'
@@ -1250,11 +1293,23 @@ function Register-WindowsService {
     try {
         $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
         if ($existing) {
-            Write-Log WARN "Service $name already exists. Replacing it."
-            try { if ($existing.Status -ne 'Stopped') { Write-Log INFO "Stopping existing service $name"; Stop-Service -Name $name -Force -ErrorAction SilentlyContinue } } catch {}
-            try { sc.exe delete "$name" | Out-Null } catch {}
+            Write-Log INFO "Service $name already exists. Stopping and removing for clean reinstall."
+            try { 
+                if ($existing.Status -ne 'Stopped') { 
+                    Write-Log INFO "Stopping existing service $name"
+                    Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                } 
+            } catch {}
+            try { 
+                Write-Log INFO "Removing existing service $name"
+                sc.exe delete "$name" | Out-Null 
+            } catch {}
             # wait briefly until it's gone
             $tries = 0; while ($tries -lt 20) { Start-Sleep -Milliseconds 250; $tries++; if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { break } }
+            if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+                Write-Log WARN "Service $name still exists after deletion attempt. Proceeding anyway."
+            }
         }
     } catch {}
 
@@ -1276,10 +1331,60 @@ function Register-WindowsService {
             $common += "--Env=$k=$(Replace-Tokens -Text ($envObj.$k))"
         }
     }
-    $common += '--Startup=automatic','--LogPath=' + (Join-Path $script:InstallRoot 'logs')
-    Write-Log INFO "Registering Windows service $name"
-    $p = Start-Process -FilePath $prunsrv -ArgumentList ($common -join ' ') -Wait -NoNewWindow -PassThru
-    if ($p.ExitCode -ne 0) { throw "Apache Commons Daemon procrun failed with exit value: $($p.ExitCode) (failed to install service)" }
+    $logPath = Join-Path $script:InstallRoot 'logs'
+    if (-not (Test-Path -Path $logPath)) { New-Item -ItemType Directory -Path $logPath -Force | Out-Null }
+    
+    # Set proper ACL permissions for install root and log directory
+    $pathsToSecure = @($script:InstallRoot, $logPath, $jreHome)
+    foreach ($path in $pathsToSecure) {
+        if (Test-Path -Path $path) {
+            try {
+                $acl = Get-Acl -Path $path
+                $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+                $acl.SetAccessRule($accessRule)
+                Set-Acl -Path $path -AclObject $acl
+            } catch {
+                Write-Log WARN "Failed to set permissions for ${path}: $($_.Exception.Message)"
+            }
+        }
+    }
+    
+    # Step 1: Install service with basic parameters
+    $installArgs = @("//IS//$name", "--DisplayName=$($svc.displayName)")
+    Write-Log INFO "Installing Windows service $name"
+    $p = Start-Process -FilePath $prunsrv -ArgumentList ($installArgs -join ' ') -Wait -NoNewWindow -PassThru
+    if ($p.ExitCode -ne 0) { throw "Apache Commons Daemon procrun install failed with exit value: $($p.ExitCode)" }
+    
+    # Step 2: Update service with full configuration
+    $stdoutLog = Join-Path $logPath "$name-stdout.log"
+    $stderrLog = Join-Path $logPath "$name-stderr.log"
+    $updateArgs = @("//US//$name",
+        "--StartMode=Java",
+        "--JavaHome=$jreHome",
+        "--StartClass=$startClass",
+        "--LogPath=$logPath",
+        "--StartPath=$script:InstallRoot",
+        "--StdOutput=$stdoutLog",
+        "--StdError=$stderrLog",
+        "--ServiceUser=LocalSystem",
+        "--PidFile=$logPath\\$name.pid")
+    
+    if ($svc.PSObject.Properties['classpath'] -and $svc.classpath) { $updateArgs += "--Classpath=$(Replace-Tokens -Text $svc.classpath)" }
+    if ($svc.PSObject.Properties['startParams'] -and $svc.startParams) { $updateArgs += "--StartParams=" + (($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
+    if ($svc.PSObject.Properties['stopClass'] -and $svc.stopClass) { $updateArgs += "--StopMode=Java","--StopClass=$($svc.stopClass)" }
+    if ($svc.PSObject.Properties['stopParams'] -and $svc.stopParams) { $updateArgs += "--StopParams=" + (($svc.stopParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
+    if ($svc.dependsOn) { $updateArgs += "--DependsOn=" + (($svc.dependsOn) -join ',') }
+    if ($svc.PSObject.Properties['jvmOptions']) { $updateArgs += "--JvmOptions=$(Build-JvmOptionsString -jvm $svc.jvmOptions)" }
+    if ($svc.PSObject.Properties['env']) {
+        $envObj = $svc.env
+        foreach ($k in $envObj.PSObject.Properties.Name) {
+            $updateArgs += "--Env=$k=$(Replace-Tokens -Text ($envObj.$k))"
+        }
+    }
+    
+    Write-Log INFO "Updating Windows service $name configuration"
+    $p = Start-Process -FilePath $prunsrv -ArgumentList ($updateArgs -join ' ') -Wait -NoNewWindow -PassThru
+    if ($p.ExitCode -ne 0) { throw "Apache Commons Daemon procrun update failed with exit value: $($p.ExitCode)" }
     # Optional: configure delayed auto-start
     if ($svc.PSObject.Properties['delayedAutoStart'] -and $svc.delayedAutoStart) {
         try {
@@ -1351,6 +1456,36 @@ function Register-ServicesOrTasks {
     } else {
         Register-WindowsService -name $svc.hsqldb.serviceName -svc $svc.hsqldb
         Register-WindowsService -name $svc.iCameraProxy.serviceName -svc $svc.iCameraProxy
+        
+        # Start services after registration
+        Write-Log INFO "Starting services..."
+        try {
+            Write-Log INFO "Starting HSQLDB service: $($svc.hsqldb.serviceName)"
+            
+            # Check if server.properties file exists before starting service
+            $serverPropsPath = Join-Path $script:InstallRoot 'hsqldb\server.properties'
+            if (-not (Test-Path -LiteralPath $serverPropsPath)) {
+                Write-Log ERROR "HSQLDB server.properties file not found at: $serverPropsPath"
+                throw "HSQLDB configuration file missing"
+            }
+            
+            Start-Service -Name $svc.hsqldb.serviceName -ErrorAction Stop
+            Write-Log INFO "HSQLDB service started successfully"
+            
+            # Wait a moment for HSQLDB to initialize before starting dependent service
+            Start-Sleep -Seconds 3
+            
+            Write-Log INFO "Starting Camera Proxy service: $($svc.iCameraProxy.serviceName)"
+            Start-Service -Name $svc.iCameraProxy.serviceName -ErrorAction Stop
+            Write-Log INFO "Camera Proxy service started successfully"
+            
+            # Wait for Camera Proxy service to fully initialize
+            Start-Sleep -Seconds 3
+        } catch {
+            Write-Log WARN "Failed to start services automatically: $($_.Exception.Message)"
+            Write-Log INFO "Check Windows Event Viewer for detailed service startup errors"
+            Write-Log INFO "Services can be started manually using the start.bat script or Windows Services console"
+        }
     }
 }
 
@@ -1362,9 +1497,17 @@ function Invoke-CustomCommand {
         if ($cmd.arguments) { $args = $cmd.arguments | ForEach-Object { Replace-Tokens -Text $_ } }
         $wd = $cmd.workingDirectory
         if ($wd) { $wd = Replace-Tokens -Text $wd } else { $wd = $script:BaseDir }
-        Write-Log INFO "Exec: $exe $($args -join ' ') (wd=$wd)"
-        $p = Start-Process -FilePath $exe -ArgumentList ($args -join ' ') -WorkingDirectory $wd -Wait -PassThru
-        if ($p.ExitCode -ne 0) { throw "ExitCode=$($p.ExitCode)" }
+        if ($exe -eq "powershell.exe") {
+            # Execute PowerShell commands directly in same session to show output
+            $cmdArgs = ($args | Where-Object { $_ -ne "-Command" }) -join ' '
+            $output = Invoke-Expression $cmdArgs
+            if ($output) { $output | Out-Host }
+            $p = $null  # Set to null since we're not using Start-Process
+        } else {
+            Write-Log INFO "Exec: $exe $($args -join ' ') (wd=$wd)"
+            $p = Start-Process -FilePath $exe -ArgumentList ($args -join ' ') -WorkingDirectory $wd -Wait -PassThru
+        }
+        if ($p -and $p.ExitCode -ne 0) { throw "ExitCode=$($p.ExitCode)" }
     } catch {
         if ($cmd.continueOnError) { Write-Log WARN "Custom command failed but continueOnError=true: $($_.Exception.Message)" }
         else { throw "Custom command failed: $($_.Exception.Message)" }
@@ -1545,6 +1688,41 @@ try {
 
     # Services / Tasks
     Register-ServicesOrTasks
+
+    # Display service status and validate installation
+    try {
+        Write-Log INFO 'Checking service status...'
+        $expectedServices = @()
+        if ($script:Config.services.hsqldb.serviceName) { $expectedServices += $script:Config.services.hsqldb.serviceName }
+        if ($script:Config.services.iCameraProxy.serviceName) { $expectedServices += $script:Config.services.iCameraProxy.serviceName }
+        $services = Get-Service -Name $expectedServices -ErrorAction SilentlyContinue
+        if ($services) {
+            Write-Host "`nService Status:" -ForegroundColor Green
+            $services | Format-Table Name, Status, StartType -AutoSize | Out-Host
+            
+            # Check if both services are running
+            $runningServices = $services | Where-Object { $_.Status -eq 'Running' }
+            $runningCount = if ($runningServices -is [array]) { $runningServices.Count } else { if ($runningServices) { 1 } else { 0 } }
+            $expectedCount = $expectedServices.Count
+            if ($runningCount -ne $expectedCount) {
+                $notRunning = $services | Where-Object { $_.Status -ne 'Running' } | Select-Object -ExpandProperty Name
+                throw "Installation failed: The following services are not running: $($notRunning -join ', '). All $expectedCount services must be running for successful installation."
+            }
+            Write-Log SUCCESS 'All services are running successfully.'
+        } else {
+            throw "Installation failed: Services not found or not accessible. Expected services: $($expectedServices -join ', '). All services must be running."
+        }
+    } catch {
+        $fatal = $_.Exception.Message
+        Write-Log ERROR $fatal
+        Show-ErrorDialog -Message $fatal
+        if (-not $script:IsQuiet) {
+            Read-Host 'Press Enter to close...'
+        } else {
+            exit 1
+        }
+        exit 1
+    }
 
     # Post-install
     Write-StartStopScripts

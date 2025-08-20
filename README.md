@@ -28,7 +28,7 @@ See `installer.config.json` for a complete example. Key sections:
 - `application.files`: Source→destination copy list. Sources are relative to the installer directory.
 - `application.properties`: Property injection into files (e.g., HSQLDB port, FileCatalyst hot folder).
 - `dependencies`: Artifacts to install (JRE, FFMPEG, Procrun, HSQLDB, FileCatalyst). Each has a `fileName`, optional `url`, `sha256`, and `target`.
-- `services` / `tasks`: Admin-level Windows Services (via Procrun) and user-level Scheduled Tasks equivalents.
+- `services` / `tasks`: Admin-level Windows Services (via Procrun) and user-level Scheduled Tasks equivalents. Services are named with `iCamera-` prefix (e.g., `iCamera-HSQLDB`, `iCamera-CameraProxy`).
 - `customCommands`: `preInstall` and `postInstall` hooks. Commands defined as `{ command, arguments[], workingDirectory, continueOnError }`.
 - `uninstall`: Optional external uninstaller command(s) and uninstall registry key.
 
