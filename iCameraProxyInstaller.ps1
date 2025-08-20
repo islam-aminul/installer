@@ -1289,48 +1289,7 @@ function Register-WindowsService {
     elseif ($svc.PSObject.Properties['mainClass']) { $startClass = $svc.mainClass }
     if (-not $startClass) { throw "Service '$name' is missing startClass/mainClass in configuration." }
 
-    # If service already exists, stop and delete it to support re-install
-    try {
-        $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
-        if ($existing) {
-            Write-Log INFO "Service $name already exists. Stopping and removing for clean reinstall."
-            try { 
-                if ($existing.Status -ne 'Stopped') { 
-                    Write-Log INFO "Stopping existing service $name"
-                    Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 2
-                } 
-            } catch {}
-            try { 
-                Write-Log INFO "Removing existing service $name"
-                sc.exe delete "$name" | Out-Null 
-            } catch {}
-            # wait briefly until it's gone
-            $tries = 0; while ($tries -lt 20) { Start-Sleep -Milliseconds 250; $tries++; if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { break } }
-            if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
-                Write-Log WARN "Service $name still exists after deletion attempt. Proceeding anyway."
-            }
-        }
-    } catch {}
-
-    $common = @("//IS//$name",
-        "--DisplayName=$($svc.displayName)",
-        "--StartMode=Java",
-        "--JavaHome=$jreHome",
-        "--StartClass=$startClass")
-    if ($svc.PSObject.Properties['classpath'] -and $svc.classpath) { $common += "--Classpath=$(Replace-Tokens -Text $svc.classpath)" }
-    if ($svc.PSObject.Properties['startParams'] -and $svc.startParams) { $common += "--StartParams=" + (($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
-    if ($svc.PSObject.Properties['stopClass'] -and $svc.stopClass) { $common += "--StopMode=Java","--StopClass=$($svc.stopClass)" }
-    if ($svc.PSObject.Properties['stopParams'] -and $svc.stopParams) { $common += "--StopParams=" + (($svc.stopParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
-    if ($svc.dependsOn) { $common += "--DependsOn=" + (($svc.dependsOn) -join ',') }
-    # iCamera JVM & ENV handling (guard for missing properties)
-    if ($svc.PSObject.Properties['jvmOptions']) { $common += "--JvmOptions=$(Build-JvmOptionsString -jvm $svc.jvmOptions)" }
-    if ($svc.PSObject.Properties['env']) {
-        $envObj = $svc.env
-        foreach ($k in $envObj.PSObject.Properties.Name) {
-            $common += "--Env=$k=$(Replace-Tokens -Text ($envObj.$k))"
-        }
-    }
+    # Ensure log directory exists
     $logPath = Join-Path $script:InstallRoot 'logs'
     if (-not (Test-Path -Path $logPath)) { New-Item -ItemType Directory -Path $logPath -Force | Out-Null }
     
@@ -1349,42 +1308,51 @@ function Register-WindowsService {
         }
     }
     
-    # Step 1: Install service with basic parameters
-    $installArgs = @("//IS//$name", "--DisplayName=$($svc.displayName)")
-    Write-Log INFO "Installing Windows service $name"
-    $p = Start-Process -FilePath $prunsrv -ArgumentList ($installArgs -join ' ') -Wait -NoNewWindow -PassThru
-    if ($p.ExitCode -ne 0) { throw "Apache Commons Daemon procrun install failed with exit value: $($p.ExitCode)" }
+    # Check if service already exists to determine operation mode
+    $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
+    $isReinstall = $existing -ne $null
     
-    # Step 2: Update service with full configuration
+    if ($isReinstall) {
+        Write-Log INFO "Service $name already exists. Performing update operation."
+        $operation = "//US//$name"
+        $operationName = "update"
+    } else {
+        Write-Log INFO "Service $name does not exist. Performing fresh install."
+        $operation = "//IS//$name"
+        $operationName = "install"
+    }
+    
+    # Build complete service arguments for single operation
     $stdoutLog = Join-Path $logPath "$name-stdout.log"
     $stderrLog = Join-Path $logPath "$name-stderr.log"
-    $updateArgs = @("//US//$name",
+    $serviceArgs = @($operation,
+        "--DisplayName=$($svc.displayName)",
+        "--LogPath=$logPath",
+        "--StartPath=$script:InstallRoot",
         "--StartMode=Java",
         "--JavaHome=$jreHome",
         "--StartClass=$startClass",
-        "--LogPath=$logPath",
-        "--StartPath=$script:InstallRoot",
         "--StdOutput=$stdoutLog",
         "--StdError=$stderrLog",
         "--ServiceUser=LocalSystem",
         "--PidFile=$logPath\\$name.pid")
     
-    if ($svc.PSObject.Properties['classpath'] -and $svc.classpath) { $updateArgs += "--Classpath=$(Replace-Tokens -Text $svc.classpath)" }
-    if ($svc.PSObject.Properties['startParams'] -and $svc.startParams) { $updateArgs += "--StartParams=" + (($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
-    if ($svc.PSObject.Properties['stopClass'] -and $svc.stopClass) { $updateArgs += "--StopMode=Java","--StopClass=$($svc.stopClass)" }
-    if ($svc.PSObject.Properties['stopParams'] -and $svc.stopParams) { $updateArgs += "--StopParams=" + (($svc.stopParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
-    if ($svc.dependsOn) { $updateArgs += "--DependsOn=" + (($svc.dependsOn) -join ',') }
-    if ($svc.PSObject.Properties['jvmOptions']) { $updateArgs += "--JvmOptions=$(Build-JvmOptionsString -jvm $svc.jvmOptions)" }
+    if ($svc.PSObject.Properties['classpath'] -and $svc.classpath) { $serviceArgs += "--Classpath=$(Replace-Tokens -Text $svc.classpath)" }
+    if ($svc.PSObject.Properties['startParams'] -and $svc.startParams) { $serviceArgs += "--StartParams=" + (($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
+    if ($svc.PSObject.Properties['stopClass'] -and $svc.stopClass) { $serviceArgs += "--StopMode=Java","--StopClass=$($svc.stopClass)" }
+    if ($svc.PSObject.Properties['stopParams'] -and $svc.stopParams) { $serviceArgs += "--StopParams=" + (($svc.stopParams | ForEach-Object { Replace-Tokens -Text $_ }) -join ' ') }
+    if ($svc.dependsOn) { $serviceArgs += "--DependsOn=" + (($svc.dependsOn) -join ',') }
+    if ($svc.PSObject.Properties['jvmOptions']) { $serviceArgs += "--JvmOptions=$(Build-JvmOptionsString -jvm $svc.jvmOptions)" }
     if ($svc.PSObject.Properties['env']) {
         $envObj = $svc.env
         foreach ($k in $envObj.PSObject.Properties.Name) {
-            $updateArgs += "--Env=$k=$(Replace-Tokens -Text ($envObj.$k))"
+            $serviceArgs += "--Env=$k=$(Replace-Tokens -Text ($envObj.$k))"
         }
     }
     
-    Write-Log INFO "Updating Windows service $name configuration"
-    $p = Start-Process -FilePath $prunsrv -ArgumentList ($updateArgs -join ' ') -Wait -NoNewWindow -PassThru
-    if ($p.ExitCode -ne 0) { throw "Apache Commons Daemon procrun update failed with exit value: $($p.ExitCode)" }
+    Write-Log INFO "Executing service $operationName for $name"
+    $p = Start-Process -FilePath $prunsrv -ArgumentList ($serviceArgs -join ' ') -Wait -NoNewWindow -PassThru
+    if ($p.ExitCode -ne 0) { throw "Apache Commons Daemon procrun $operationName failed with exit value: $($p.ExitCode)" }
     # Optional: configure delayed auto-start
     if ($svc.PSObject.Properties['delayedAutoStart'] -and $svc.delayedAutoStart) {
         try {

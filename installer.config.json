@@ -99,7 +99,7 @@
     },
     "hsqldb": {
       "name": "HSQLDB",
-      "url": "https://downloads.sourceforge.net/project/hsqldb/hsqldb/hsqldb_2_5/hsqldb-2.5.1.zip",
+      "url": "https://excellmedia.dl.sourceforge.net/project/hsqldb/hsqldb/hsqldb_2_5/hsqldb-2.5.1.zip?viasf=1",
       "sha256": "REPLACE_WITH_SHA256",
       "target": "<Install Root>\\hsqldb",
       "enforceLocalOnly": false,
