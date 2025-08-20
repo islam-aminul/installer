@@ -132,7 +132,7 @@ function Expand-7ZipArchive {
     if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
     Write-Log INFO "Extracting 7z archive to $Destination using: $sevenZip"
     $args = @('x','-y',("-o{0}" -f $Destination), $Archive)
-    $proc = Start-Process -FilePath $sevenZip -ArgumentList $args -NoNewWindow -PassThru -Wait
+    $proc = Start-Process -FilePath $sevenZip -ArgumentList $args -PassThru -Wait -WindowStyle Hidden
     if ($proc.ExitCode -ne 0) { throw ("7-Zip extraction failed with exit code {0}" -f $proc.ExitCode) }
 }
 
@@ -258,6 +258,7 @@ function Replace-Tokens {
     )
     $result = $Text
     if ($script:InstallRoot) { $result = $result -replace [regex]::Escape('<Install Root>'), [Regex]::Escape($script:InstallRoot) -replace '\\E','' }
+    if ($script:BaseDir) { $result = $result -replace [regex]::Escape('<Self>'), [Regex]::Escape($script:BaseDir) -replace '\\E','' }
     if ($script:DatabasePort) { $result = $result -replace '\$\{DatabasePort\}', [string]$script:DatabasePort }
     return $result
 }
@@ -690,9 +691,17 @@ function Ensure-Dependency {
     $ext = ([System.IO.Path]::GetExtension($src)).ToLower()
     if ($ext -eq '.zip') {
         Write-Log INFO "Extracting $displayName (.zip) to $target"
+        # For reinstallation: remove existing content to ensure clean extraction
+        if (Test-Path -LiteralPath $target) {
+            Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Expand-Archive -LiteralPath $src -DestinationPath $target -Force
     } elseif ($ext -eq '.7z') {
         Write-Log INFO "Extracting $displayName (.7z) to $target"
+        # For reinstallation: remove existing content to ensure clean extraction
+        if (Test-Path -LiteralPath $target) {
+            Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Expand-7ZipArchive -Archive $src -Destination $target
     } elseif ($ext -eq '.exe') {
         # Leave EXE in target, preserve original filename
@@ -719,11 +728,61 @@ function Ensure-Dependency {
             Write-Log SUCCESS "FFmpeg ready: $ffexe"
         } else {
             Write-Log ERROR "FFmpeg not found after extraction. Expected: $ffexe"
-            return $false
         }
+    }
+    # Normalize HSQLDB layout if this dependency is HSQLDB
+    if ($dep -and (
+        ($dep.target -and ($dep.target -like '*\\hsqldb')) -or
+        ($dep.name -and ($dep.name -match '(?i)hsqldb'))
+    )) {
+        Normalize-HsqldbLayout -Root $target
     }
     # Keep the downloaded file in self folder as requested; do not delete
     return $true
+}
+
+function Normalize-HsqldbLayout {
+    param([Parameter(Mandatory=$true)][string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    
+    Write-Log INFO "Normalizing HSQLDB layout in: $Root"
+    
+    # Look for nested hsqldb directories (common pattern: hsqldb-x.x.x/hsqldb/)
+    $nestedDirs = Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue | Where-Object { 
+        $_.Name -match '^hsqldb-[\d\.]+$' -or $_.Name -eq 'hsqldb' 
+    }
+    
+    foreach ($nestedDir in $nestedDirs) {
+        $innerHsqldbDir = Join-Path $nestedDir.FullName 'hsqldb'
+        if (Test-Path -LiteralPath $innerHsqldbDir -PathType Container) {
+            Write-Log INFO "Found nested HSQLDB structure: $($nestedDir.Name)/hsqldb"
+            
+            # Move contents from nested hsqldb directory to root
+            $items = Get-ChildItem -LiteralPath $innerHsqldbDir -ErrorAction SilentlyContinue
+            foreach ($item in $items) {
+                $destPath = Join-Path $Root $item.Name
+                if (Test-Path -LiteralPath $destPath) {
+                    Write-Log WARN "Destination already exists, skipping: $($item.Name)"
+                    continue
+                }
+                Move-Item -LiteralPath $item.FullName -Destination $destPath -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Remove the now-empty nested directory structure
+            Remove-Item -LiteralPath $nestedDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log INFO "Removed nested directory: $($nestedDir.Name)"
+        }
+    }
+    
+    # Verify essential HSQLDB files are present (check both root and lib subdirectory)
+    $hsqldbJar = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'hsqldb*.jar' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $sqltoolJar = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'sqltool*.jar' -ErrorAction SilentlyContinue | Select-Object -First 1
+    
+    if ($hsqldbJar -and $sqltoolJar) {
+        Write-Log SUCCESS "HSQLDB layout normalized. Found: $($hsqldbJar.Name), $($sqltoolJar.Name)"
+    } else {
+        Write-Log WARN "HSQLDB normalization completed but essential JAR files may be missing"
+    }
 }
 
 function Find-AvailablePort {
@@ -740,70 +799,259 @@ function Configure-HSQLDB {
     if (-not $hs) { throw 'HSQLDB dependency not configured.' }
     $ok = Ensure-Dependency -dep $hs
     if (-not $ok) { throw 'HSQLDB dependency acquisition failed.' }
+    
+    # Simplified configuration
     $dbName = if ($hs.dbName) { $hs.dbName } else { 'db0' }
     $portRange = $hs.portRange
     $script:DatabasePort = Find-AvailablePort -Start $portRange.start -End $portRange.end
     Write-Log INFO "Selected HSQLDB port: $script:DatabasePort"
+    
+    # Establish consistent paths
     $hsRoot = Replace-Tokens -Text $hs.target
-    $dataDir = Join-Path $hsRoot 'data'
+    $dataDir = Join-Path $hsRoot 'db'
+    $libDir = Join-Path $hsRoot 'lib'
+    
+    
+    # Ensure directories exist
     if (-not (Test-Path -LiteralPath $dataDir)) { New-Item -ItemType Directory -Path $dataDir -Force | Out-Null }
-    # server.properties (file-based database ensures state persisted on disk while data served in-memory)
-    $serverProps = @(
-        "server.database.0=file:$dataDir\$dbName",
-        "server.dbname.0=$dbName",
-        "server.port=$script:DatabasePort",
-        "server.silent=true",
-        "server.no_system_exit=true"
-    )
-    Set-Content -LiteralPath (Join-Path $hsRoot 'server.properties') -Value $serverProps -Encoding ASCII
-    # Create sqltool.rc entries for both file and server modes (per HSQLDB format)
-    $dataDirUnix = ($dataDir -replace '\\','/')
+    
+    # Locate JAR files with detailed logging
+    $hsqldbJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'hsqldb*.jar' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $sqltoolJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'sqltool*.jar' -ErrorAction SilentlyContinue | Select-Object -First 1
+    
+    if (-not $hsqldbJar) {
+        Write-Log ERROR "HSQLDB JAR not found in $hsRoot"
+        throw 'HSQLDB JAR file not found after extraction'
+    }
+    if (-not $sqltoolJar) {
+        Write-Log ERROR "SqlTool JAR not found in $hsRoot"
+        throw 'SqlTool JAR file not found after extraction'
+    }
+    
+    
+    $javaExe = Resolve-JavaExe -Root (Join-Path $script:InstallRoot 'jre')
+    $classpath = "$($hsqldbJar.FullName);$($sqltoolJar.FullName)"
+    
+    # Create simplified sqltool.rc with absolute paths
     $rcPath = Join-Path $hsRoot 'sqltool.rc'
+    $dbFilePathUnix = ($dataDir -replace '\\','/') + "/" + $dbName
+    
     $rcContent = @(
+        "# HSQLDB Configuration for iCamera",
         "urlid ${dbName}_file",
-        "url jdbc:hsqldb:file:$dataDirUnix/$dbName",
+        "url jdbc:hsqldb:file:$dbFilePathUnix;shutdown=true;create=true",
         "username SA",
         "password",
         "",
-        "urlid ${dbName}_server",
+        "urlid localhost-sa",
         "url jdbc:hsqldb:hsql://localhost:$script:DatabasePort/$dbName",
+        "username SA",
+        "password",
+        "",
+        "urlid mem",
+        "url jdbc:hsqldb:mem:$dbName",
         "username SA",
         "password"
     )
     Set-Content -LiteralPath $rcPath -Value $rcContent -Encoding ASCII
+    Write-Log INFO "Created sqltool.rc: $rcPath"
     
-    # Initialize DB files using file mode (creates $dbName.* files on disk even without server running)
-    $sqltoolJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'sqltool*.jar' | Select-Object -First 1
-    $hsqldbJar = Get-ChildItem -Path $hsRoot -Recurse -Filter 'hsqldb*.jar' | Select-Object -First 1
-    if ($sqltoolJar -and $hsqldbJar) {
-        $javaExe = Resolve-JavaExe -Root (Join-Path $script:InstallRoot 'jre')
-        $classpath = "$($hsqldbJar.FullName);$($sqltoolJar.FullName)"
-        $bootstrapSql = Join-Path $hsRoot 'bootstrap.sql'
-        $bootstrap = @(
-            'CREATE TABLE IF NOT EXISTS ICAMERA_TEST(ID INTEGER PRIMARY KEY, NAME VARCHAR(64));',
-            'SET DATABASE SQL SYNTAX MYS TRUE;',
-            'SHUTDOWN;'
-        )
-        Set-Content -LiteralPath $bootstrapSql -Value $bootstrap -Encoding ASCII
-        Write-Log INFO 'Bootstrapping HSQLDB file database to create initial db files.'
-        & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool "--rcFile=$rcPath" "${dbName}_file" $bootstrapSql
-        Remove-Item -LiteralPath $bootstrapSql -Force -ErrorAction SilentlyContinue
+    # Create server.properties file for HSQLDB server configuration
+    $serverPropsPath = Join-Path $hsRoot 'server.properties'
+    $serverPropsContent = @(
+        "# HSQLDB Server Configuration for iCamera",
+        "server.database.0=file:$dbFilePathUnix",
+        "server.dbname.0=$dbName",
+        "server.port=$script:DatabasePort",
+        "server.silent=false",
+        "server.trace=false",
+        "server.remote_open=false",
+        "server.no_system_exit=true"
+    )
+    Set-Content -LiteralPath $serverPropsPath -Value $serverPropsContent -Encoding ASCII
+    Write-Log INFO "Created server.properties: $serverPropsPath"
+    
+    # Clean up any existing lock files
+    $dbLockPath = Join-Path $dataDir "$dbName.lck"
+    if (Test-Path -LiteralPath $dbLockPath) {
+        Write-Log WARN "Removing stale lock file: $dbLockPath"
+        Remove-Item -LiteralPath $dbLockPath -Force -ErrorAction SilentlyContinue
+    }
+    
+    # Skip bootstrap - let initialization scripts handle database creation
+    Write-Log INFO 'Skipping bootstrap - database will be created by initialization scripts.'
         
-        # Run additional init scripts if configured (against file DB)
-        if ($hs.sqlInitScripts) {
-            Write-Log INFO 'Running configured SQL initialization scripts for HSQLDB.'
-            foreach ($scriptPath in $hs.sqlInitScripts) {
-                $resolved = Replace-Tokens -Text $scriptPath
-                if (Test-Path -LiteralPath $resolved) {
-                    & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool "--rcFile=$rcPath" "${dbName}_file" $resolved
-                } else {
-                    Write-Log WARN "SQL init script not found: $resolved"
-                }
+    # Check if database-scripts folder has db0.script and replace the bootstrapped one
+    $dbScriptsDir = Join-Path $script:BaseDir 'database-scripts'
+    $db0ScriptSrc = Join-Path $dbScriptsDir 'db0.script'
+    if (Test-Path -LiteralPath $db0ScriptSrc) {
+        Write-Log INFO 'Found existing db0.script, replacing bootstrapped database files.'
+        Copy-Item -LiteralPath $db0ScriptSrc -Destination (Join-Path $dataDir "$dbName.script") -Force
+    }
+        
+    # Copy initialization scripts to database directory - HSQLDB will execute them automatically
+    if ($hs.sqlInitScripts) {
+        Write-Log INFO 'Copying database initialization scripts to database directory.'
+        
+        foreach ($scriptPath in $hs.sqlInitScripts) {
+            $resolved = Replace-Tokens -Text $scriptPath
+            if (Test-Path -LiteralPath $resolved) {
+                $scriptName = Split-Path -Leaf $resolved
+                $destPath = Join-Path $dataDir $scriptName
+                Copy-Item -LiteralPath $resolved -Destination $destPath -Force
+                Write-Log SUCCESS "Initialization script copied to database directory: $scriptName"
+            } else {
+                Write-Log ERROR "Initialization script not found: $resolved"
+                throw "Database initialization script not found: $resolved"
             }
         }
-    } else {
-        Write-Log WARN 'sqltool.jar or hsqldb.jar not found; skipping DB initialization.'
     }
+        
+    # Start HSQLDB server for application scripts
+    if ($hs.applicationScripts) {
+        Write-Log INFO 'Starting HSQLDB server for application scripts.'
+        
+        # Start HSQLDB server using server.properties
+        $serverPropsPath = Join-Path $hsRoot 'server.properties'
+        
+        # Create bin directory and batch file to start the server
+        $binDir = Join-Path $hsRoot 'bin'
+        if (-not (Test-Path -LiteralPath $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
+        $serverBatPath = Join-Path $binDir 'runServer.bat'
+        $webServerBatPath = Join-Path $binDir 'runWebServer.bat'
+        $serverBatContent = @(
+            '@echo off',
+            "cd /d `"$hsRoot`"",
+            "`"$javaExe`" -cp `"$classpath`" org.hsqldb.server.Server --props `"$serverPropsPath`""
+        )
+        Set-Content -LiteralPath $serverBatPath -Value $serverBatContent -Encoding ASCII
+        
+        # Create runWebServer.bat
+        $webServerBatContent = @(
+            '@echo off',
+            "cd /d `"$hsRoot`"",
+            "`"$javaExe`" -cp `"$classpath`" org.hsqldb.server.WebServer --props `"$serverPropsPath`""
+        )
+        Set-Content -LiteralPath $webServerBatPath -Value $webServerBatContent -Encoding ASCII
+        
+        # Start the server process
+        $serverProcess = Start-Process -FilePath $serverBatPath -PassThru -WindowStyle Minimized
+        Write-Log INFO "HSQLDB server started with PID: $($serverProcess.Id)"
+        
+        # Wait and validate server is running (single attempt)
+        Start-Sleep -Seconds 5
+        try {
+            # Test connection to verify server is running
+            & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool --rcFile="$rcPath" "localhost-sa" --sql="SELECT 1;" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log SUCCESS "HSQLDB server is running and accepting connections"
+            } else {
+                Write-Log WARN "Server connection test failed, but continuing with installation"
+            }
+        } catch {
+            Write-Log WARN "Server connection test failed, but continuing with installation"
+        }
+        
+        Write-Log INFO 'Running application-specific database scripts.'
+        
+        foreach ($scriptPath in $hs.applicationScripts) {
+            $resolved = Replace-Tokens -Text $scriptPath
+            Write-Log INFO "Executing application script: $resolved"
+            if (Test-Path -LiteralPath $resolved) {
+                $result = & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool --rcFile="$rcPath" "localhost-sa" "$resolved" 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    # Check if error is due to table already existing (common during reinstalls)
+                    $resultStr = $result | Out-String
+                    if ($resultStr -match "object name already exists|table already exists") {
+                        Write-Log WARN "Some database objects already exist, continuing installation: $resolved"
+                    } else {
+                        Write-Log ERROR "Application script failed: $resolved - Exit code: $LASTEXITCODE"
+                        Write-Log ERROR "Output: $result"
+                        Write-Log ERROR "Command: $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool --rcFile=`"$rcPath`" ${dbName}_file $resolved"
+                        throw "Application database script failed: $resolved"
+                    }
+                }
+                Write-Log SUCCESS "Application script executed successfully: $resolved"
+            } else {
+                Write-Log ERROR "Application script not found: $resolved"
+                throw "Application database script not found: $resolved"
+            }
+        }
+    }
+        
+    # Create simplified database manager batch script
+    $sqltoolCfg = $hs.sqltoolConfig
+    if ($sqltoolCfg.createDbManager) {
+        $dbManagerBat = Join-Path $binDir 'runManagerSwing.bat'
+        $javaHomePath = Join-Path $script:InstallRoot 'jre'
+        $dbManagerContent = @(
+            '@echo off',
+            'REM HSQLDB Database Manager GUI',
+            '',
+            'set HSQLDB_HOME=%~dp0..',
+            "set JAVA_HOME=$javaHomePath",
+            "set HSQLDB_JAR=$($hsqldbJar.FullName)",
+            "set SQLTOOL_JAR=$($sqltoolJar.FullName)",
+            'set CLASSPATH=%HSQLDB_JAR%;%SQLTOOL_JAR%',
+            '',
+            'echo Starting HSQLDB Database Manager...',
+            'echo HSQLDB JAR: %HSQLDB_JAR%',
+            'echo SqlTool JAR: %SQLTOOL_JAR%',
+            '',
+            'echo Launching Database Manager GUI...',
+            '"%JAVA_HOME%\bin\java.exe" -cp "%CLASSPATH%" org.hsqldb.util.DatabaseManagerSwing --rcfile "%HSQLDB_HOME%\sqltool.rc" --urlid localhost-sa',
+            'if errorlevel 1 (',
+            '    echo.',
+            '    echo ERROR: Database Manager failed to start or encountered an error.',
+            '    echo Check that the HSQLDB server is running and accessible.',
+            '    echo.',
+            '    pause',
+            ')'
+        )
+        Set-Content -LiteralPath $dbManagerBat -Value $dbManagerContent -Encoding ASCII
+        Write-Log INFO "Created database manager script: $dbManagerBat"
+    }
+        
+    # Execute post-installation queries using direct URL connection
+    if ($hs.postInstallQueries) {
+        Write-Log INFO 'Executing post-installation database queries.'
+        $directUrl = "jdbc:hsqldb:file:$dbFilePathUnix;shutdown=true"
+        
+        foreach ($queryName in $hs.postInstallQueries.PSObject.Properties.Name) {
+            $queryConfig = $hs.postInstallQueries.$queryName
+            $querySql = $queryConfig.sql
+            $description = if ($queryConfig.description) { $queryConfig.description } else { $queryName }
+            
+            Write-Log INFO "Executing query: $description"
+            $queryFile = Join-Path $hsRoot "postinstall_$queryName.sql"
+            Set-Content -LiteralPath $queryFile -Value $querySql -Encoding ASCII
+            
+            $result = & $javaExe -cp $classpath org.hsqldb.cmdline.SqlTool --rcFile="$rcPath" --sql="$(Get-Content -LiteralPath $queryFile -Raw)" "localhost-sa" 2>&1
+            Remove-Item -LiteralPath $queryFile -Force -ErrorAction SilentlyContinue
+            
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log SUCCESS "Query '$queryName' executed successfully"
+                if ($result -and $result.ToString().Trim()) {
+                    Write-Log INFO "Query result: $result"
+                }
+                
+                # Check install condition for FileCatalyst decision
+                if ($queryName -eq 'fileCatalystDecision' -and $queryConfig.installCondition) {
+                    if ($result -match 'TRUE') {
+                        Write-Log INFO 'FileCatalyst HotFolder installation recommended by database query.'
+                        $script:ForceFileCatalystInstall = $true
+                    } else {
+                        Write-Log INFO 'FileCatalyst HotFolder installation not recommended by database query.'
+                        $script:SkipFileCatalystInstall = $true
+                    }
+                }
+            } else {
+                Write-Log WARN "Post-install query '$queryName' failed: $result"
+            }
+        }
+    }
+    
+    Write-Log SUCCESS 'HSQLDB database initialization completed successfully.'
 }
 
 function Install-FileCatalystHotFolder {
@@ -885,7 +1133,7 @@ function Install-FileCatalystHotFolder {
         if ([string]::IsNullOrWhiteSpace($saveArgs)) { $saveArgs = ('/SAVEINF="{0}"' -f $infPath) }
         Write-Log INFO "Running FileCatalyst HotFolder SAVEINF (standard install): $saveArgs (wd=$script:BaseDir)"
         $p = Start-Process -FilePath $exePath -ArgumentList $saveArgs -WorkingDirectory $script:BaseDir -Wait -PassThru
-        if ($p.ExitCode -ne 0) { Write-Log WARN ("FileCatalyst SAVEINF exited with code {0}" -f $p.ExitCode) }
+        if ($p.ExitCode -ne 0) { Write-Log ERROR ("FileCatalyst SAVEINF exited with code {0}" -f $p.ExitCode) }
     }
 }
 
@@ -959,7 +1207,7 @@ function Update-ApplicationProperties {
         Get-Content -LiteralPath $file | ForEach-Object { if ($_ -match '^(?<k>[^#=]+)=(?<v>.*)$') { $props[$Matches.k.Trim()]=$Matches.v } }
     }
     # Set dynamic values
-    if ($map.dbPort) { $props[$map.dbPort] = [string]$script:DatabasePort }
+    if ($map.dbUrl) { $props[$map.dbUrl] = "jdbc:hsqldb:hsql://localhost:$($script:DatabasePort)/db0" }
     if ($map.PSObject.Properties['fileCatalystHotFolders']) { $props[$map.fileCatalystHotFolders] = $hotFolders }
     if ($map.PSObject.Properties['fileCatalystInstallDir']) { $props[$map.fileCatalystInstallDir] = $installDir }
     # Write back
@@ -1226,14 +1474,14 @@ function Uninstall-Application {
         if (Test-Path $key) { Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue }
         Write-Log SUCCESS 'Uninstallation completed.'
         if (-not $script:IsQuiet) {
-            Read-Host 'Press Enter to close...'
+            Read-Host 'Press Enter to close'
         } else {
             exit 0
         }
     } catch {
         Write-Log ERROR "Uninstallation failed: $($_.Exception.Message)"
         if (-not $script:IsQuiet) {
-            Read-Host 'Press Enter to close...'
+            Read-Host 'Press Enter to close'
         } else {
             exit 1
         }

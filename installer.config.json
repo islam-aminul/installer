@@ -32,17 +32,13 @@
       {
         "source": "logback.xml",
         "dest": "<Install Root>\\proxy\\"
-      },
-      {
-        "source": "cameraproxy.sql",
-        "dest": "<Install Root>\\proxy\\"
       }
     ],
     "properties": {
       "cameraproxy": {
         "file": "<Install Root>\\proxy\\proxy-details.properties",
         "keys": {
-          "dbPort": "db.port",
+          "dbUrl": "url",
           "fileCatalystHotFolders": "filecatalyst.hot_folders",
           "fileCatalystInstallDir": "filecatalyst.install_dir"
         }
@@ -113,8 +109,32 @@
         "end": 9100
       },
       "sqlInitScripts": [
-        "<Install Root>\\proxy\\cameraproxy.sql"
+        "<Self>\\database-scripts\\create.script",
+        "<Self>\\database-scripts\\insert.script"
       ],
+      "applicationScripts": [
+        "<Self>\\CameraProxy.sql"
+      ],
+      "postInstallQueries": {
+        "displayInfo": {
+          "description": "Display installation summary information",
+          "sql": "SELECT COUNT(*) as config_count FROM config_table;"
+        },
+        "fileCatalystDecision": {
+          "description": "Check if FileCatalyst HotFolder should be installed",
+          "sql": "SELECT COUNT(*) as config_count FROM config_table;",
+          "installCondition": "config_count > 0"
+        }
+      },
+      "sqltoolConfig": {
+        "defaultUsername": "SA",
+        "defaultPassword": "",
+        "personalDbPath": "${user.home}/db/personal",
+        "personalDbOptions": "shutdown=true;ifexist=true",
+        "personalTransactionIsolation": "TRANSACTION_READ_COMMITTED",
+        "memoryDbId": "mem",
+        "createDbManager": true
+      },
       "search": {
         "patterns": [
           "hsqldb-*",

@@ -16,15 +16,17 @@ if errorlevel 1 (
   exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" %*
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Maximized -File "%PS1%" %*
 set "EXITCODE=%ERRORLEVEL%"
 
-rem If no args were supplied, give the user a chance to read output
+rem If no args were supplied, give the user a chance to read output only on error
 if "%~1"=="" (
-  echo.
-  echo Exit code: %EXITCODE%
-  echo Press any key to close...
-  pause >nul
+  if %EXITCODE% neq 0 (
+    echo.
+    echo Exit code: %EXITCODE%
+    echo Press any key to close...
+    pause >nul
+  )
 )
 
 exit /b %EXITCODE%
