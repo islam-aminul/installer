@@ -6,6 +6,14 @@ REM Attempts direct JAR replacement first, falls back to service stop/start if n
 
 echo [%date% %time%] Starting Service-based Update...
 
+REM Configuration variables - modify these as needed
+set "SERVICE_NAME=iCamera-Proxy"
+set "DB_URL_ID=localhost-sa"
+set "JAR_FILENAME=CameraProxy.jar"
+set "HSQLDB_PATTERN=hsql*"
+set "SERVICE_STOP_TIMEOUT=30"
+set "SERVICE_START_TIMEOUT=30"
+
 REM Set relative paths
 set "SCRIPT_DIR=%~dp0"
 set "PROXY_DIR=%SCRIPT_DIR%.."
@@ -20,7 +28,7 @@ set "HSQLDB_DIR="
 set "SQLTOOL_RC="
 set "SERVER_PROPERTIES="
 
-for /d %%d in ("%INSTALL_ROOT%\hsql*") do (
+for /d %%d in ("%INSTALL_ROOT%\%HSQLDB_PATTERN%") do (
     if exist "%%d\sqltool.rc" (
         set "HSQLDB_DIR=%%d"
         set "SQLTOOL_RC=%%d\sqltool.rc"
@@ -63,7 +71,7 @@ if exist "%SCRIPT_DIR%update.sql" (
     echo [%date% %time%] Running SQL updates...
     echo [%date% %time%] Running SQL updates >> "%UPDATE_LOG%"
     
-    java -cp "%SQLTOOL_JAR%" org.hsqldb.cmdline.SqlTool --rcFile="%SQLTOOL_RC%" --sql="\i %SCRIPT_DIR%update.sql" db0
+    java -cp "%SQLTOOL_JAR%" org.hsqldb.cmdline.SqlTool --rcFile="%SQLTOOL_RC%" --sql="\i %SCRIPT_DIR%update.sql" %DB_URL_ID%
     
     if !errorlevel! neq 0 (
         echo [%date% %time%] ERROR: SQL update failed
@@ -93,18 +101,18 @@ if exist "%SCRIPT_DIR%logback.xml" (
 )
 
 REM Replace JAR file if new version exists
-if exist "%SCRIPT_DIR%CameraProxy.jar" (
+if exist "%SCRIPT_DIR%%JAR_FILENAME%" (
     echo [%date% %time%] Attempting direct JAR replacement...
     echo [%date% %time%] Attempting direct JAR replacement >> "%UPDATE_LOG%"
     
     REM Backup current JAR
-    if exist "%PROXY_DIR%\CameraProxy.jar" (
-        copy "%PROXY_DIR%\CameraProxy.jar" "%PROXY_DIR%\CameraProxy.jar.bak" >nul
+    if exist "%PROXY_DIR%\%JAR_FILENAME%" (
+        copy "%PROXY_DIR%\%JAR_FILENAME%" "%PROXY_DIR%\%JAR_FILENAME%.bak" >nul
         echo [%date% %time%] Current JAR backed up
     )
     
     REM Try direct replacement first
-    copy "%SCRIPT_DIR%CameraProxy.jar" "%PROXY_DIR%\CameraProxy.jar" >nul 2>&1
+    copy "%SCRIPT_DIR%%JAR_FILENAME%" "%PROXY_DIR%\%JAR_FILENAME%" >nul 2>&1
     if !errorlevel!==0 (
         echo [%date% %time%] Direct JAR replacement successful
         echo [%date% %time%] Direct JAR replacement successful >> "%UPDATE_LOG%"
@@ -116,18 +124,18 @@ if exist "%SCRIPT_DIR%CameraProxy.jar" (
     echo [%date% %time%] Direct replacement failed, trying service approach >> "%UPDATE_LOG%"
     
     REM Stop the service
-    echo [%date% %time%] Stopping iCamera-Proxy service...
-    sc stop "iCamera-Proxy" >nul 2>&1
+    echo [%date% %time%] Stopping %SERVICE_NAME% service...
+    sc stop "%SERVICE_NAME%" >nul 2>&1
     
-    REM Wait for service to stop (max 30 seconds)
+    REM Wait for service to stop (max timeout seconds)
     set /a "wait_count=0"
     :wait_stop
-    sc query "iCamera-Proxy" | find "STOPPED" >nul
+    sc query "%SERVICE_NAME%" | find "STOPPED" >nul
     if !errorlevel!==0 goto :service_stopped
     
     set /a "wait_count+=1"
-    if !wait_count! gtr 30 (
-        echo [%date% %time%] ERROR: Service did not stop within 30 seconds
+    if !wait_count! gtr %SERVICE_STOP_TIMEOUT% (
+        echo [%date% %time%] ERROR: Service did not stop within %SERVICE_STOP_TIMEOUT% seconds
         echo [%date% %time%] ERROR: Service stop timeout >> "%UPDATE_LOG%"
         goto :restore_jar
     )
@@ -150,13 +158,13 @@ if exist "%SCRIPT_DIR%CameraProxy.jar" (
     echo [%date% %time%] JAR replaced with service stopped >> "%UPDATE_LOG%"
     
     REM Start the service
-    echo [%date% %time%] Starting iCamera-Proxy service...
-    sc start "iCamera-Proxy" >nul 2>&1
+    echo [%date% %time%] Starting %SERVICE_NAME% service...
+    sc start "%SERVICE_NAME%" >nul 2>&1
     
-    REM Wait for service to start (max 30 seconds)
+    REM Wait for service to start (max timeout seconds)
     set /a "wait_count=0"
     :wait_start
-    sc query "iCamera-Proxy" | find "RUNNING" >nul
+    sc query "%SERVICE_NAME%" | find "RUNNING" >nul
     if !errorlevel!==0 (
         echo [%date% %time%] Service started successfully
         echo [%date% %time%] Service started successfully >> "%UPDATE_LOG%"
@@ -164,8 +172,8 @@ if exist "%SCRIPT_DIR%CameraProxy.jar" (
     )
     
     set /a "wait_count+=1"
-    if !wait_count! gtr 30 (
-        echo [%date% %time%] WARNING: Service did not start within 30 seconds, but JAR was replaced
+    if !wait_count! gtr %SERVICE_START_TIMEOUT% (
+        echo [%date% %time%] WARNING: Service did not start within %SERVICE_START_TIMEOUT% seconds, but JAR was replaced
         echo [%date% %time%] WARNING: Service start timeout >> "%UPDATE_LOG%"
         goto :jar_replaced
     )
@@ -175,13 +183,13 @@ if exist "%SCRIPT_DIR%CameraProxy.jar" (
     
     :restore_jar
     REM Restore backup JAR if replacement failed
-    if exist "%PROXY_DIR%\CameraProxy.jar.bak" (
+    if exist "%PROXY_DIR%\%JAR_FILENAME%.bak" (
         echo [%date% %time%] Restoring backup JAR...
-        copy "%PROXY_DIR%\CameraProxy.jar.bak" "%PROXY_DIR%\CameraProxy.jar" >nul
+        copy "%PROXY_DIR%\%JAR_FILENAME%.bak" "%PROXY_DIR%\%JAR_FILENAME%" >nul
         echo [%date% %time%] Backup JAR restored >> "%UPDATE_LOG%"
         
         REM Try to start service with original JAR
-        sc start "iCamera-Proxy" >nul 2>&1
+        sc start "%SERVICE_NAME%" >nul 2>&1
     )
     exit /b 1
     
