@@ -1,13 +1,53 @@
 #requires -Version 5.1
 <#!
- iCamera Proxy Installer (Config-driven)
- Modes:
-   - Interactive (default)
-   - --quiet (unattended)
-   - --uninstall (remove)
- Exit codes: 0 success, 1 general failure, 2 insufficient privileges (elevation denied), 3 another installer instance is running
-
- Primary constraint: All behavior driven by installer.config.json; avoid hardcoded product values.
+ iCamera Proxy Installer (Admin-Only, Config-Driven)
+ 
+ OVERVIEW:
+ This installer deploys the iCamera Proxy system as Windows services with HSQLDB database.
+ All configuration is driven by installer.config.json to avoid hardcoded values.
+ 
+ EXECUTION MODES:
+   - Interactive (default): Shows UI prompts and progress
+   - --quiet: Unattended installation with minimal output
+   - --uninstall: Removes installed components and services
+ 
+ ADMIN REQUIREMENTS:
+ - REQUIRES Administrator privileges (shows UAC prompt if needed)
+ - Installs Windows services using Apache Procrun
+ - Creates system directories and sets permissions
+ - Configures service recovery and startup behavior
+ 
+ INSTALLATION FLOW:
+ 1. Admin Privilege Check & UAC Elevation
+ 2. Drive Selection & Directory Creation
+ 3. Dependency Download/Validation (JRE, HSQLDB, Procrun, FFmpeg, FileCatalyst)
+ 4. Database Setup & Port Allocation
+ 5. Service Registration (HSQLDB + iCamera Proxy)
+ 6. Configuration File Generation
+ 7. Service Startup & Validation
+ 8. Registry Uninstall Entry Creation
+ 
+ EXIT CODES:
+   0 = Success
+   1 = General failure
+   2 = Insufficient privileges (elevation denied)
+   3 = Another installer instance running
+ 
+ DEPENDENCIES:
+ - Windows 10+ or Server 2016+
+ - PowerShell 5.1+
+ - 10GB+ disk space, 8GB+ RAM
+ - Internet connection (for downloads)
+ 
+ STRUCTURE CREATED:
+ C:\iCamera\
+ ├── jre\           (Java Runtime)
+ ├── hsqldb\        (Database server)
+ ├── procrun\       (Service wrapper)
+ ├── proxy\         (Application files)
+ ├── ffmpeg\        (Media processing)
+ ├── filecatalyst\  (File transfer)
+ └── logs\          (Installation & service logs)
 !#>
 
 param(
@@ -210,7 +250,6 @@ function Show-LocateOrDownloadDialog {
 }
 $script:ConfigPath = Join-Path $script:BaseDir 'installer.config.json'
 $script:IsQuiet = [bool]$quiet
-$script:UserLevelInstall = $false  # flips to true if elevation denied or not admin
 $script:Config = $null
 $script:LockFile = Join-Path $env:TEMP 'iCameraProxyInstaller.lock'
 $script:LogDir = $null
@@ -225,6 +264,8 @@ $script:DatabasePort = $null
 $script:FileCatalystINF = Join-Path $script:BaseDir 'filecatalyst_hotfolder.inf'
 $script:SkipShaChecks = $false
 $script:DependencyMode = '' # 'locate_all' | 'download_all' | 'ask_each'
+$script:SkipFileCatalystInstall = $false
+$script:ForceFileCatalystInstall = $false
 
 function Write-Log {
     param(
@@ -292,23 +333,33 @@ function Replace-Tokens {
 
 function Is-Admin { return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 
-function Ensure-ElevationOrFallback {
+function Ensure-AdminPrivileges {
     if (Is-Admin) { Write-Log INFO 'Process is elevated.'; return }
     Write-Log WARN 'Not running as administrator. Attempting elevation...'
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = (Get-Process -Id $PID).Path
         $psi.Verb = 'runas'
-        $args = @()
-        $args += '-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath)
-        if ($script:IsQuiet) { $args += '--quiet' }
-        if ($uninstall) { $args += '--uninstall' }
-        $psi.Arguments = $args -join ' '
+        $cmdArgs = @()
+        $cmdArgs += '-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath)
+        if ($script:IsQuiet) { $cmdArgs += '--quiet' }
+        if ($uninstall) { $cmdArgs += '--uninstall' }
+        $psi.Arguments = $cmdArgs -join ' '
         [System.Diagnostics.Process]::Start($psi) | Out-Null
+        Write-Log INFO 'Elevated process started. Exiting current instance.'
         exit 0
     } catch {
-        Write-Log WARN "Elevation denied or failed. Continuing with user-level installation."
-        $script:UserLevelInstall = $true
+        Write-Log ERROR 'Administrator privileges are required for this installation.'
+        Write-Log ERROR 'Elevation was denied or failed.'
+        if (-not $script:IsQuiet) {
+            Write-Host "`nThis installer requires Administrator privileges to:" -ForegroundColor Yellow
+            Write-Host "  - Install Windows services" -ForegroundColor Yellow
+            Write-Host "  - Create system directories" -ForegroundColor Yellow
+            Write-Host "  - Configure system permissions" -ForegroundColor Yellow
+            Write-Host "`nPlease right-click and 'Run as Administrator'" -ForegroundColor Yellow
+            pause
+        }
+        exit 2
     }
 }
 
@@ -334,11 +385,6 @@ function New-InstallerLock {
 function Remove-InstallerLock { if (Test-Path -LiteralPath $script:LockFile) { Remove-Item -LiteralPath $script:LockFile -Force -ErrorAction SilentlyContinue } }
 
 function Select-InstallationDrive {
-    if ($script:UserLevelInstall) {
-        $script:InstallRoot = Join-Path $env:LOCALAPPDATA 'iCamera'
-        Write-Log INFO "User-level install root: $script:InstallRoot"
-        return
-    }
     $drives = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 -and $_.FileSystem }
     if (-not $drives) { throw 'No fixed drives found.' }
     $driveList = @($drives)
@@ -353,7 +399,7 @@ function Select-InstallationDrive {
         $sel = Read-Host "Select drive number (default $default)"
         if ([string]::IsNullOrWhiteSpace($sel)) { $script:SelectedDrive=$default } else { $script:SelectedDrive=$sorted[[int]$sel-1].DeviceID }
     }
-    $script:InstallRoot = "$($script:SelectedDrive)\iCamera"
+    $script:InstallRoot = Join-Path $script:SelectedDrive 'iCamera'
     Write-Log INFO "Install root: $script:InstallRoot"
 }
 
@@ -375,12 +421,7 @@ function Test-SystemPrereqs {
     $minOk = ($ver.Major -ge 10) -or ($os.Caption -match 'Server 2016|Server 2019|Server 2022')
     if (-not $minOk) { throw "Unsupported OS: $($os.Caption) $($os.Version)" }
     # Disk
-    # PowerShell 5.1 doesn't support ternary operator; use explicit if/else
-    if ($script:UserLevelInstall) {
-        $drive = (Get-Item $env:LOCALAPPDATA).PSDrive
-    } else {
-        $drive = Get-PSDrive -Name $script:SelectedDrive.TrimEnd(':')
-    }
+    $drive = Get-PSDrive -Name $script:SelectedDrive.TrimEnd(':')
     $freeGB = [math]::Round($drive.Free/1GB,2)
     if ($freeGB -lt 10) { throw "Insufficient disk space on $($drive.Name): needs >= 10 GB (free=$freeGB GB)" }
     # Memory
@@ -450,8 +491,16 @@ function Get-LocalFile {
 function Select-LocalFileDialog {
     param(
         [Parameter(Mandatory=$true)][string]$Title,
-        [string]$Filter = 'Archives (*.zip;*.exe)|*.zip;*.exe|All files (*.*)|*.*'
+        [string]$Filter = 'All files (*.*)|*.*',
+        [array]$Extensions = @()
     )
+    # Build dynamic filter from extensions if provided
+    if ($Extensions -and $Extensions.Count -gt 0) {
+        $extList = $Extensions | ForEach-Object { "*$_" }
+        $extString = $extList -join ';'
+        $Filter = "Supported files ($extString)|$extString|All files (*.*)|*.*"
+    }
+    
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         $dlg = New-Object System.Windows.Forms.OpenFileDialog
@@ -594,8 +643,11 @@ function Ensure-Dependency {
     $url = $dep.url
     # Replace unsupported ternary operator with if/else for PowerShell 5.1
     if ($dep.sha256) { $sha = $dep.sha256.ToLower() } else { $sha = '' }
-    $target = Replace-Tokens -Text $dep.target
-    if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+    $target = $null
+    if ($dep.PSObject.Properties['target'] -and $dep.PSObject.Properties['target'].Value) {
+        $target = Replace-Tokens -Text $dep.PSObject.Properties['target'].Value
+        if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+    }
     # Determine display name and local file if any
     $displayName = if ($dep.name) { [string]$dep.name } else { 'package' }
     $local = $null
@@ -678,7 +730,8 @@ function Ensure-Dependency {
         if (-not $script:IsQuiet) {
             $choice = Show-LocateOrDownloadDialog -Name $displayName -Url $url
             if ($choice -eq 'locate') {
-                $picked = Select-LocalFileDialog -Title "Locate package for $displayName"
+                $extensions = if ($dep.search -and $dep.search.extensions) { $dep.search.extensions } else { @() }
+                $picked = Select-LocalFileDialog -Title "Locate package for $displayName" -Extensions $extensions
                 if ($picked) { $src = $picked } else { Write-Log WARN "User canceled file selection for $displayName" }
             } elseif ($choice -eq 'download') {
                 if ([string]::IsNullOrWhiteSpace($url)) { Write-Log ERROR "No download URL configured for $displayName"; return $false }
@@ -714,52 +767,58 @@ function Ensure-Dependency {
         if ($calc -ne $sha) { Write-Log ERROR "Checksum mismatch for $displayName. Expected $sha, got $calc"; return $false }
     }
     if ($script:SkipShaChecks -and $sha) { Write-Log WARN "Skipping SHA256 verification for $displayName by configuration." }
-    # Extract or copy based on actual source file extension
-    $ext = ([System.IO.Path]::GetExtension($src)).ToLower()
-    if ($ext -eq '.zip') {
-        Write-Log INFO "Extracting $displayName (.zip) to $target"
-        # For reinstallation: remove existing content to ensure clean extraction
-        if (Test-Path -LiteralPath $target) {
-            Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    # Extract or copy based on actual source file extension (only if target exists)
+    if ($target) {
+        $ext = ([System.IO.Path]::GetExtension($src)).ToLower()
+        if ($ext -eq '.zip') {
+            Write-Log INFO "Extracting $displayName (.zip) to $target"
+            # For reinstallation: remove existing content to ensure clean extraction
+            if (Test-Path -LiteralPath $target) {
+                Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Expand-Archive -LiteralPath $src -DestinationPath $target -Force
+        } elseif ($ext -eq '.7z') {
+            Write-Log INFO "Extracting $displayName (.7z) to $target"
+            # For reinstallation: remove existing content to ensure clean extraction
+            if (Test-Path -LiteralPath $target) {
+                Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Expand-7ZipArchive -Archive $src -Destination $target
+        } elseif ($ext -eq '.exe') {
+            # Leave EXE in target, preserve original filename
+            $srcBase = [System.IO.Path]::GetFileName($src)
+            Copy-Item -LiteralPath $src -Destination (Join-Path $target $srcBase) -Force
+        } else {
+            Copy-Item -LiteralPath $src -Destination $target -Force
         }
-        Expand-Archive -LiteralPath $src -DestinationPath $target -Force
-    } elseif ($ext -eq '.7z') {
-        Write-Log INFO "Extracting $displayName (.7z) to $target"
-        # For reinstallation: remove existing content to ensure clean extraction
-        if (Test-Path -LiteralPath $target) {
-            Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        Expand-7ZipArchive -Archive $src -Destination $target
-    } elseif ($ext -eq '.exe') {
-        # Leave EXE in target, preserve original filename
-        $srcBase = [System.IO.Path]::GetFileName($src)
-        Copy-Item -LiteralPath $src -Destination (Join-Path $target $srcBase) -Force
     } else {
-        Copy-Item -LiteralPath $src -Destination $target -Force
+        Write-Log INFO "$displayName downloaded but no target directory specified - keeping in base directory"
     }
     # Normalize JRE layout if this dependency is the Java runtime
-    if ($dep -and (
-        ($dep.target -and ($dep.target -like '*\\jre')) -or
+    if ($dep -and $target -and (
+        ($dep.PSObject.Properties['target'] -and $dep.PSObject.Properties['target'].Value -like '*\\jre') -or
         ($dep.name -and ($dep.name -match '(?i)jre|corretto|openjdk'))
     )) {
         Normalize-JreLayout -Root $target
     }
     # Normalize FFmpeg layout if this dependency is FFmpeg
-    if ($dep -and (
-        ($dep.target -and ($dep.target -like '*\\ffmpeg')) -or
+    if ($dep -and $target -and (
+        ($dep.PSObject.Properties['target'] -and $dep.PSObject.Properties['target'].Value -like '*\\ffmpeg') -or
         ($dep.name -and ($dep.name -match '(?i)ffmpeg'))
     )) {
         Normalize-FfmpegLayout -Root $target
-        $ffexe = Join-Path $target 'bin\ffmpeg.exe'
-        if (Test-Path -LiteralPath $ffexe) {
-            Write-Log INFO "FFmpeg ready: $ffexe"
-        } else {
-            Write-Log ERROR "FFmpeg not found after extraction. Expected: $ffexe"
-        }
+    }
+    # Normalize Procrun layout if this dependency is Procrun
+    if ($dep -and $target -and (
+        ($dep.PSObject.Properties['target'] -and $dep.PSObject.Properties['target'].Value -like '*\\procrun') -or
+        ($dep.name -and ($dep.name -match '(?i)procrun'))
+    )) {
+        # Procrun doesn't need layout normalization - it's typically a single executable
+        Write-Log INFO "Procrun dependency processed: $target"
     }
     # Normalize HSQLDB layout if this dependency is HSQLDB
-    if ($dep -and (
-        ($dep.target -and ($dep.target -like '*\\hsqldb')) -or
+    if ($dep -and $target -and (
+        ($dep.PSObject.Properties['target'] -and $dep.PSObject.Properties['target'].Value -like '*\\hsqldb') -or
         ($dep.name -and ($dep.name -match '(?i)hsqldb'))
     )) {
         Normalize-HsqldbLayout -Root $target
@@ -1061,7 +1120,13 @@ function Configure-HSQLDB {
                 
                 # Check install condition for FileCatalyst decision
                 if ($queryName -eq 'fileCatalystDecision' -and $queryConfig.installCondition) {
-                    if ($result -match 'TRUE') {
+                    # Parse the result to check if condition is met
+                    $shouldInstall = $false
+                    if ($result -and $result.Trim() -eq 'TRUE') {
+                        $shouldInstall = $true
+                    }
+                    
+                    if ($shouldInstall) {
                         Write-Log INFO 'FileCatalyst HotFolder installation recommended by application configuration.'
                         $script:ForceFileCatalystInstall = $true
                     } else {
@@ -1100,25 +1165,37 @@ function Install-FileCatalystHotFolder {
         Write-Log INFO 'FileCatalyst HotFolder installation skipped based on application configuration.'
         return
     }
-    Ensure-Dependency -dep $fc
-    # Discover installer EXE: prefer any .exe in target; fallback to URL filename in local folder
-    $targetDir = Replace-Tokens -Text $fc.target
-    $exePath = $null
-    if (Test-Path -LiteralPath $targetDir) {
-        $cand = Get-ChildItem -Path $targetDir -Filter '*.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($cand) { $exePath = $cand.FullName }
-        if (-not $exePath) {
-            # try to prefer names containing 'transferagent' or 'install'
-            $pref = Get-ChildItem -Path $targetDir -Filter '*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'transferagent|install' } | Select-Object -First 1
-            if ($pref) { $exePath = $pref.FullName }
-        }
+    
+    # Check if FileCatalyst installation was forced by database query
+    if (-not $script:ForceFileCatalystInstall) {
+        Write-Log INFO 'FileCatalyst HotFolder installation not explicitly required by application configuration.'
+        return
     }
-    if (-not $exePath -and $fc.url) {
+    Ensure-Dependency -dep $fc
+    # Discover installer EXE: check for downloaded file in base directory or use search patterns
+    $exePath = $null
+    
+    # First try to find downloaded file from URL
+    if ($fc.url) {
         try {
             $urlFile = [System.IO.Path]::GetFileName((New-Object System.Uri($fc.url)).AbsolutePath)
             $maybeLocal = Join-Path $script:BaseDir $urlFile
             if (Test-Path -LiteralPath $maybeLocal) { $exePath = $maybeLocal }
         } catch {}
+    }
+    
+    # If target is defined, check target directory for EXE files
+    if (-not $exePath -and $fc.PSObject.Properties['target'] -and $fc.PSObject.Properties['target'].Value) {
+        $targetDir = Replace-Tokens -Text $fc.PSObject.Properties['target'].Value
+        if (Test-Path -LiteralPath $targetDir) {
+            $cand = Get-ChildItem -Path $targetDir -Filter '*.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($cand) { $exePath = $cand.FullName }
+            if (-not $exePath) {
+                # try to prefer names containing 'transferagent' or 'install'
+                $pref = Get-ChildItem -Path $targetDir -Filter '*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'transferagent|install' } | Select-Object -First 1
+                if ($pref) { $exePath = $pref.FullName }
+            }
+        }
     }
     if (-not $exePath) { Write-Log WARN 'FileCatalyst HotFolder installer EXE not found.'; return }
     # Derive INF path from dependency name (e.g., "FileCatalyst HotFolder" -> filecatalyst_hotfolder.inf)
@@ -1178,6 +1255,9 @@ function Install-FileCatalystHotFolder {
         $p = Start-Process -FilePath $exePath -ArgumentList $saveArgs -WorkingDirectory $script:BaseDir -Wait -PassThru
         if ($p.ExitCode -ne 0) { Write-Log ERROR ("FileCatalyst SAVEINF exited with code {0}" -f $p.ExitCode) }
     }
+    
+    # Configure hot folder after installation
+    Configure-FileCatalystHotFolder
 }
 
 function Get-FileCatalystInstallDir {
@@ -1195,6 +1275,64 @@ function Get-FileCatalystInstallDir {
         }
     } catch {}
     return $null
+}
+
+function Configure-FileCatalystHotFolder {
+    Write-Log INFO 'Configuring FileCatalyst HotFolder with iCamera integration...'
+    
+    # Get FileCatalyst configuration from config
+    $fc = $script:Config.dependencies.filecatalyst
+    if (-not $fc -or -not $fc.hotfolder) {
+        Write-Log WARN 'FileCatalyst hotfolder configuration not found - skipping hotfolder configuration'
+        return
+    }
+    
+    # Get FileCatalyst installation directory
+    $installDir = Get-FileCatalystInstallDir
+    if (-not $installDir) {
+        Write-Log WARN 'FileCatalyst installation directory not found - skipping hotfolder configuration'
+        return
+    }
+    
+    # Get hotfolder configuration from JSON
+    $hotfolderConfig = $fc.hotfolder
+    
+    # Create hotfolder directory in iCamera installation root
+    $hotfolderPath = Join-Path $script:InstallRoot $hotfolderConfig.relativePath
+    if (-not (Test-Path -LiteralPath $hotfolderPath)) {
+        New-Item -ItemType Directory -Path $hotfolderPath -Force | Out-Null
+        Write-Log INFO "Created hotfolder directory: $hotfolderPath"
+    }
+    
+    # Generate unique hotfolder ID with timestamp
+    $hotfolderID = "$($hotfolderConfig.id)-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    
+    # Create hotfolders.xml configuration
+    $xmlPath = Join-Path $installDir 'hotfolders.xml'
+    $xmlContent = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<hotfolders>
+    <hotfolder>
+        <id>$hotfolderID</id>
+        <name>$($hotfolderConfig.name)</name>
+        <path>$hotfolderPath</path>
+        <enabled>$($hotfolderConfig.enabled.ToString().ToLower())</enabled>
+        <recursive>$($hotfolderConfig.recursive.ToString().ToLower())</recursive>
+        <deleteAfterTransfer>$($hotfolderConfig.deleteAfterTransfer.ToString().ToLower())</deleteAfterTransfer>
+        <transferMode>$($hotfolderConfig.transferMode)</transferMode>
+        <description>$($hotfolderConfig.description)</description>
+    </hotfolder>
+</hotfolders>
+"@
+    
+    try {
+        Set-Content -LiteralPath $xmlPath -Value $xmlContent -Encoding UTF8
+        Write-Log INFO "Created hotfolders.xml configuration: $xmlPath"
+        Write-Log INFO "HotFolder ID: $hotfolderID"
+        Write-Log INFO "HotFolder Path: $hotfolderPath"
+    } catch {
+        Write-Log ERROR "Failed to create hotfolders.xml: $($_.Exception.Message)"
+    }
 }
 
 function Get-FileCatalystHotFolder {
@@ -1381,79 +1519,40 @@ function Register-WindowsService {
     }
 }
 
-function Register-ScheduledTaskEquivalent {
-    param([string]$taskName,[psobject]$svc,[string]$delayISO)
-    $jre = Resolve-JavaExe -Root (Join-Path $script:InstallRoot 'jre')
-    $actionArgs = @()
-    if ($svc.PSObject.Properties['jvmOptions']) { $actionArgs += (Build-JvmOptionsString -jvm $svc.jvmOptions).Split(' ') }
-    if ($svc.PSObject.Properties['classpath'] -and $svc.classpath) { $actionArgs += '-cp'; $actionArgs += (Replace-Tokens -Text $svc.classpath) }
-    # Reinstall-safe: remove existing scheduled task if present
-    try {
-        $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existing) {
-            Write-Log WARN "Scheduled task $taskName already exists. Replacing it."
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-        }
-    } catch {}
-    # Resolve start class for scheduled task as well
-    $startClass2 = $null
-    if ($svc.PSObject.Properties['startClass']) { $startClass2 = $svc.startClass }
-    elseif ($svc.PSObject.Properties['mainClass']) { $startClass2 = $svc.mainClass }
-    if (-not $startClass2) { throw "Scheduled Task action missing startClass/mainClass for service '$name'" }
-    $actionArgs += $startClass2
-    if ($svc.PSObject.Properties['startParams'] -and $svc.startParams) { $actionArgs += ($svc.startParams | ForEach-Object { Replace-Tokens -Text $_ }) }
-    $argLine = ($actionArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    if ($delayISO) { $trigger.Delay = $delayISO }
-    # Run at boot as SYSTEM without user logon, with highest privileges
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $action = New-ScheduledTaskAction -Execute $jre -Argument $argLine -WorkingDirectory $script:InstallRoot
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-    Register-ScheduledTask -TaskName $taskName -Trigger $trigger -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Log INFO "Registered scheduled task $taskName"
-}
 
 function Register-ServicesOrTasks {
     $svc = $script:Config.services
-    $tasks = $script:Config.tasks
-    if ($script:UserLevelInstall) {
-        # HSQLDB first
-        Register-ScheduledTaskEquivalent -taskName $tasks.hsqldbTask.name -svc $svc.hsqldb -delayISO $tasks.hsqldbTask.delay
-        # iCamera with delay and implicit dependency
-        Register-ScheduledTaskEquivalent -taskName $tasks.icameraTask.name -svc $svc.iCameraProxy -delayISO $tasks.icameraTask.delay
-    } else {
-        Register-WindowsService -name $svc.hsqldb.serviceName -svc $svc.hsqldb
-        Register-WindowsService -name $svc.iCameraProxy.serviceName -svc $svc.iCameraProxy
+    Register-WindowsService -name $svc.hsqldb.serviceName -svc $svc.hsqldb
+    Register-WindowsService -name $svc.iCameraProxy.serviceName -svc $svc.iCameraProxy
+    
+    # Start services after registration
+    Write-Log INFO "Starting services..."
+    try {
+        Write-Log INFO "Starting HSQLDB service: $($svc.hsqldb.serviceName)"
         
-        # Start services after registration
-        Write-Log INFO "Starting services..."
-        try {
-            Write-Log INFO "Starting HSQLDB service: $($svc.hsqldb.serviceName)"
-            
-            # Check if server.properties file exists before starting service
-            $serverPropsPath = Join-Path $script:InstallRoot 'hsqldb\server.properties'
-            if (-not (Test-Path -LiteralPath $serverPropsPath)) {
-                Write-Log ERROR "HSQLDB server.properties file not found at: $serverPropsPath"
-                throw "HSQLDB configuration file missing"
-            }
-            
-            Start-Service -Name $svc.hsqldb.serviceName -ErrorAction Stop
-            Write-Log INFO "HSQLDB service started successfully"
-            
-            # Wait a moment for HSQLDB to initialize before starting dependent service
-            Start-Sleep -Seconds 3
-            
-            Write-Log INFO "Starting Camera Proxy service: $($svc.iCameraProxy.serviceName)"
-            Start-Service -Name $svc.iCameraProxy.serviceName -ErrorAction Stop
-            Write-Log INFO "Camera Proxy service started successfully"
-            
-            # Wait for Camera Proxy service to fully initialize
-            Start-Sleep -Seconds 3
-        } catch {
-            Write-Log WARN "Failed to start services automatically: $($_.Exception.Message)"
-            Write-Log INFO "Check Windows Event Viewer for detailed service startup errors"
-            Write-Log INFO "Services can be started manually using the start.bat script or Windows Services console"
+        # Check if server.properties file exists before starting service
+        $serverPropsPath = Join-Path $script:InstallRoot 'hsqldb\server.properties'
+        if (-not (Test-Path -LiteralPath $serverPropsPath)) {
+            Write-Log ERROR "HSQLDB server.properties file not found at: $serverPropsPath"
+            throw "HSQLDB configuration file missing"
         }
+        
+        Start-Service -Name $svc.hsqldb.serviceName -ErrorAction Stop
+        Write-Log INFO "HSQLDB service started successfully"
+        
+        # Wait a moment for HSQLDB to initialize before starting dependent service
+        Start-Sleep -Seconds 3
+        
+        Write-Log INFO "Starting Camera Proxy service: $($svc.iCameraProxy.serviceName)"
+        Start-Service -Name $svc.iCameraProxy.serviceName -ErrorAction Stop
+        Write-Log INFO "Camera Proxy service started successfully"
+        
+        # Wait for Camera Proxy service to fully initialize
+        Start-Sleep -Seconds 3
+    } catch {
+        Write-Log WARN "Failed to start services automatically: $($_.Exception.Message)"
+        Write-Log INFO "Check Windows Event Viewer for detailed service startup errors"
+        Write-Log INFO "Services can be started manually using the start.bat script or Windows Services console"
     }
 }
 
@@ -1488,30 +1587,17 @@ function Invoke-PostInstallCommands { if ($script:Config.customCommands.postInst
 function Write-StartStopScripts {
     $startBat = Join-Path $script:InstallRoot 'start-icamera.bat'
     $stopBat = Join-Path $script:InstallRoot 'stop-icamera.bat'
-    if ($script:UserLevelInstall) {
-        $start = @(
-            '@echo off',
-            ('schtasks /Run /TN "{0}"' -f $script:Config.tasks.hsqldbTask.name),
-            'timeout /t 2 >nul',
-            ('schtasks /Run /TN "{0}"' -f $script:Config.tasks.icameraTask.name)
-        )
-        $stop = @(
-            '@echo off',
-            ('schtasks /End /TN "{0}" 2>nul' -f $script:Config.tasks.icameraTask.name),
-            ('schtasks /End /TN "{0}" 2>nul' -f $script:Config.tasks.hsqldbTask.name)
-        )
-    } else {
-        $start = @(
-            "@echo off",
-            "sc start $($script:Config.services.hsqldb.serviceName)",
-            "sc start $($script:Config.services.iCameraProxy.serviceName)"
-        )
-        $stop = @(
-            "@echo off",
-            "sc stop $($script:Config.services.iCameraProxy.serviceName)",
-            "sc stop $($script:Config.services.hsqldb.serviceName)"
-        )
-    }
+    $start = @(
+        '@echo off',
+        ('net start "{0}"' -f $script:Config.services.hsqldb.serviceName),
+        'timeout /t 2 >nul',
+        ('net start "{0}"' -f $script:Config.services.iCameraProxy.serviceName)
+    )
+    $stop = @(
+        '@echo off',
+        ('net stop "{0}"' -f $script:Config.services.iCameraProxy.serviceName),
+        ('net stop "{0}"' -f $script:Config.services.hsqldb.serviceName)
+    )
     Set-Content -LiteralPath $startBat -Value $start -Encoding ASCII
     Set-Content -LiteralPath $stopBat -Value $stop -Encoding ASCII
 }
@@ -1553,19 +1639,12 @@ function Set-FilePermissions {
 function Uninstall-Application {
     Write-Log INFO 'Starting uninstallation...'
     try {
-        # Stop and remove services/tasks
-        if (Is-Admin) {
-            sc stop $script:Config.services.iCameraProxy.serviceName 2>$null | Out-Null
-            sc stop $script:Config.services.hsqldb.serviceName 2>$null | Out-Null
-            Start-Sleep -Seconds 2
-            & (Replace-Tokens -Text $script:Config.services.iCameraProxy.procrunExe) "//DS//$($script:Config.services.iCameraProxy.serviceName)" 2>$null | Out-Null
-            & (Replace-Tokens -Text $script:Config.services.hsqldb.procrunExe) "//DS//$($script:Config.services.hsqldb.serviceName)" 2>$null | Out-Null
-        } else {
-            schtasks /End /TN $script:Config.tasks.icameraTask.name 2>$null | Out-Null
-            schtasks /End /TN $script:Config.tasks.hsqldbTask.name 2>$null | Out-Null
-            schtasks /Delete /TN $script:Config.tasks.icameraTask.name /F 2>$null | Out-Null
-            schtasks /Delete /TN $script:Config.tasks.hsqldbTask.name /F 2>$null | Out-Null
-        }
+        # Stop and remove services
+        sc stop $script:Config.services.iCameraProxy.serviceName 2>$null | Out-Null
+        sc stop $script:Config.services.hsqldb.serviceName 2>$null | Out-Null
+        Start-Sleep -Seconds 2
+        & (Replace-Tokens -Text $script:Config.services.iCameraProxy.procrunExe) "//DS//$($script:Config.services.iCameraProxy.serviceName)" 2>$null | Out-Null
+        & (Replace-Tokens -Text $script:Config.services.hsqldb.procrunExe) "//DS//$($script:Config.services.hsqldb.serviceName)" 2>$null | Out-Null
         # FileCatalyst uninstaller
         if ($script:Config.uninstall.filecatalystUninstall) {
             $u = $script:Config.uninstall.filecatalystUninstall
@@ -1610,7 +1689,7 @@ try {
         $script:InstallRoot = (Join-Path $env:LOCALAPPDATA 'iCamera')
         Uninstall-Application
     }
-    Ensure-ElevationOrFallback
+    Ensure-AdminPrivileges
     Select-InstallationDrive
     Ensure-InstallDirectories
     Set-FilePermissions -path $script:InstallRoot

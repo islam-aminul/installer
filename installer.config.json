@@ -122,8 +122,8 @@
         },
         "fileCatalystDecision": {
           "description": "FileCatalyst HotFolder should be installed",
-          "sql": "SELECT COUNT(*) as recording_utility_adapter_present FROM config_table WHERE config_name LIKE 'default_config1';",
-          "installCondition": "recording_utility_adapter_present > 0"
+          "sql": "SELECT CASE WHEN COUNT(*) > 0 THEN 'TRUE' ELSE 'FALSE' END as should_install_filecatalyst FROM config_table WHERE config_name LIKE 'default_config';",
+          "installCondition": "should_install_filecatalyst = 'TRUE'"
         }
       },
       "sqltoolConfig": {
@@ -149,7 +149,6 @@
       "name": "FileCatalyst HotFolder",
       "url": "https://filecatalyst.software/public/filecatalyst/Direct/4.0.0.375/Windows/install_fc_hotfolder.exe",
       "sha256": "REPLACE_WITH_SHA256",
-      "target": "<Install Root>\\filecatalyst",
       "enforceLocalOnly": false,
       "saveInfArgs": [
         "/SAVEINF=filecatalyst_settings.inf"
@@ -159,6 +158,16 @@
         "/VERYSILENT",
         "/NORESTART"
       ],
+      "hotfolder": {
+        "id": "iCamera-HotFolder",
+        "name": "iCamera HotFolder",
+        "relativePath": "filecatalyst-hotfolder",
+        "enabled": true,
+        "recursive": true,
+        "deleteAfterTransfer": false,
+        "transferMode": "auto",
+        "description": "Automatically configured hotfolder for iCamera system"
+      },
       "search": {
         "patterns": [
           "*hotfolder*",
