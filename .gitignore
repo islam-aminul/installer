@@ -48,7 +48,6 @@ logs/
 # FileCatalyst runtime/config artifacts
 filecatalyst_settings.inf
 filecatalyst_hotfolder.inf
-hotfolders.xml
 
 # Build/output directories (none currently, future-proofing)
 /dist/
